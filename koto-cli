@@ -1,6 +1,6 @@
 #!/bin/sh
 
-version_number="1.2.2"
+version_number="1.2.3"
 
 # UI
 
@@ -118,7 +118,7 @@ version_info() {
 
 update_script() {
     info "[branch:$branch] Checking for Update.."
-    update="$(curl --fail-with-body -sL -A "$agent" "https://raw.githubusercontent.com/VVAT3R/koto-cli/$branch/koto-cli")" || die "[branch:$branch] Connection error: $update"
+    update="$(curl --fail-with-body -sL -A "$agent" "https://raw.githubusercontent.com/armoox/koto-cli/$branch/koto-cli")" || die "[branch:$branch] Connection error: $update"
     new_version="$(printf "%s" "$update" | sed -nE 's|^version_number="([^"]+)"$|\1|p')"
     [ -z "$new_version" ] && die "[branch:$branch] Invalid response."
     update="$(printf "%s\n" "$update" | diff -u "$0" -)"
