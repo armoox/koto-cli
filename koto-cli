@@ -179,16 +179,25 @@ select_quality() {
     refr_flag="--referrer=${anikoto_referer:-$provider_base}/"
     episode=$(printf "%s" "$result" | cut -d'>' -f2)
 
-    # obfuscated streams (megaplay) need the local FIFO feed to play
+    # non-direct hosts (megaplay etc.) used to ship obfuscated segments that
+    # the player can't handle, and the local feed stripped the junk per
+    # segment. the CDNs now deliver clean MPEG-TS, so probe the first segment
+    # and only use the feed when a real junk prefix is detected
     if [ "$anikoto_direct" != 1 ] && [ -n "$episode" ]; then
-        if [ -n "$anikoto_feed_pid" ] && [ "$anikoto_feed_variant" != "$episode" ]; then
-            anikoto_feed_cleanup
+        _probe_off="$(probe_anikoto_offset "$episode")"
+        if [ -z "$_probe_off" ] || [ "$_probe_off" = "0" ]; then
+            anikoto_direct=1
+            [ -n "$anikoto_feed_pid" ] && anikoto_feed_cleanup
+        else
+            if [ -n "$anikoto_feed_pid" ] && [ "$anikoto_feed_variant" != "$episode" ]; then
+                anikoto_feed_cleanup
+            fi
+            if [ -z "$anikoto_feed_pid" ]; then
+                start_anikoto_fifo "$episode" "$_probe_off" || { warn "Failed to prepare local feed for stream"; episode=""; return 1; }
+            fi
+            anikoto_feed_variant="$episode"
+            episode="$anikoto_feed_m3u8"
         fi
-        if [ -z "$anikoto_feed_pid" ]; then
-            start_anikoto_fifo "$episode" || { warn "Failed to prepare local feed for stream"; episode=""; return 1; }
-        fi
-        anikoto_feed_variant="$episode"
-        episode="$anikoto_feed_m3u8"
     fi
 }
 
@@ -410,6 +419,40 @@ get_anikoto_m3u8() {
     return 1
 }
 
+# finds where the real MPEG-TS stream starts inside a segment: looks for 4
+# sync bytes (0x47) spaced 188 bytes apart and prints the 0-based offset.
+# a result of 0 means the segment is already clean MPEG-TS (no junk prefix).
+detect_ts_offset() {
+    od -An -v -t u1 "$1" 2>/dev/null | tr -s '[:space:]' '\n' | awk '
+        NF { b[n++] = $1 }
+        END {
+            for (o = 0; o + 564 < n; o++) {
+                if (b[o] == 71 && b[o + 188] == 71 && b[o + 376] == 71 && b[o + 564] == 71) { print o; exit }
+            }
+        }'
+}
+
+# fetches the first segment of an HLS variant (via a cheap HTTP Range probe)
+# and detects its MPEG-TS offset; 0 = clean stream, 252 (or other) = the old
+# obfuscated format the local feed was built to strip
+probe_anikoto_offset() {
+    _variant_url="$1"
+    _pl="$(anikoto_curl_raw -e "${anikoto_referer}/" "$_variant_url")"
+    printf '%s' "$_pl" | grep -q "EXTM3U" || return 1
+    _first_seg="$(printf '%s' "$_pl" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^#' | head -n1)"
+    [ -n "$_first_seg" ] || return 1
+    case "$_first_seg" in
+        http*) ;;
+        *) _first_seg="$(printf '%s' "$_variant_url" | sed 's|[^/]*$||')$_first_seg" ;;
+    esac
+    _probe_file="$(mktemp "${TMPDIR:-/tmp}/anikoto-probe-XXXXXX")"
+    _off=""
+    curl -sL --max-time 15 -A "$agent" -e "${anikoto_referer}/" -H 'Range: bytes=0-1599' "$_first_seg" > "$_probe_file" 2>/dev/null
+    [ -s "$_probe_file" ] && _off="$(detect_ts_offset "$_probe_file")"
+    rm -f "$_probe_file"
+    [ -n "$_off" ] && printf '%s' "$_off"
+}
+
 anikoto_feed_pid=""
 anikoto_feed_dir=""
 anikoto_feed_m3u8=""
@@ -490,6 +533,7 @@ anikoto_feed_stream() {
 # visible, which lets mpv re-open segments for backward seeking
 start_anikoto_fifo() {
     _variant_url="$1"
+    _off="${2:-252}"
     _pl="$(anikoto_curl_raw -e "${anikoto_referer}/" "$_variant_url")"
     printf '%s' "$_pl" | grep -q "EXTM3U" || { warn "Failed to fetch HLS playlist for stream"; return 1; }
     anikoto_feed_dir="$(mktemp -d "${TMPDIR:-/tmp}/anikoto-fifo-XXXXXX")" || return 1
@@ -514,7 +558,6 @@ start_anikoto_fifo() {
         && { warn "No segments in HLS playlist for stream"; rm -rf "$anikoto_feed_dir"; anikoto_feed_dir=""; return 1; }
 
     anikoto_feed_m3u8="$anikoto_feed_dir/playlist.m3u8"
-    _off=252
     _pidfile="$anikoto_feed_dir/feed.pid"
     # daemonize (orphan it) so the shell's `wait` doesn't block on it
     (anikoto_feed_stream "$anikoto_feed_dir" "$_off" &
