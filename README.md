@@ -21,12 +21,12 @@ A standalone POSIX shell script to browse, search and watch anime from the comma
 
 **Install:**
 ```sh
-curl -fsSL https://raw.githubusercontent.com/VVAT3R/koto-cli/main/install.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/armoox/koto-cli/main/install.sh | sudo sh
 ```
 
 **Uninstall:**
 ```sh
-curl -fsSL https://raw.githubusercontent.com/VVAT3R/koto-cli/main/uninstall.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/armoox/koto-cli/main/uninstall.sh | sudo sh
 ```
 
 <details>
