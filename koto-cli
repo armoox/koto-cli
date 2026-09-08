@@ -310,6 +310,8 @@ anikoto_desc() {
 anikoto_m3u8=""
 anikoto_referer=""
 anikoto_direct=0
+anikoto_master_body=""
+anikoto_master_url=""
 
 # extract server link-ids from a servers JSON; each type is tried in order and
 # all matching links are returned (hsub = hard subs, sub, soft-server, dub)
@@ -352,6 +354,8 @@ get_anikoto_m3u8() {
     anikoto_m3u8=""
     anikoto_referer=""
     anikoto_direct=0
+    anikoto_master_body=""
+    anikoto_master_url=""
     anime_id_anikoto "$_slug" || return 1
     anime_episodes_json_anikoto "$anikoto_numeric_id"
     _anchor="$(printf '%s' "$anikoto_ep_clean" \
@@ -419,17 +423,48 @@ get_anikoto_m3u8() {
         [ -z "$_file_id" ] && _file_id="$(printf '%s' "$_embed_page" | grep -oE 'data-id="[0-9]+"' | head -1 | grep -oE '[0-9]+')"
         [ -z "$_file_id" ] && continue
         _host="$(printf '%s' "$_embed_url" | sed -E 's|^(https?://[^/]+).*|\1|')"
-        # megap.norami.top (s=tcdn) serves a plain clean HLS playlist; the default
-        # cdn (imgnex.top) is Cloudflare-blocked for scripts and/or token-obfuscated.
-        # request the trusted-CDN variant first, fall back to the default.
-        _src="$(anikoto_curl "${_host}/stream/getSources?id=${_file_id}&type=${_rtype}&s=tcdn")"
-        [ -z "$_src" ] && _src="$(anikoto_curl "${_host}/stream/getSources?id=${_file_id}&type=${_rtype}")"
-        [ -z "$_src" ] && continue
-        _m3u8="$(printf '%s' "$_src" | sed -nE 's|.*"sources":\{?"file":"([^"]*)".*|\1|p' | sed 's|\\/|/|g')"
-        [ -z "$_m3u8" ] && _m3u8="$(printf '%s' "$_src" | sed -nE 's|.*"file":"([^"]*\.m3u8[^"]*)".*|\1|p' | sed 's|\\/|/|g')"
-        [ -z "$_m3u8" ] && _m3u8="$(decrypt_anikoto_enc "$_src")"
-        [ -z "$_m3u8" ] && continue
-        anikoto_m3u8="$_m3u8"
+        # CDN routing varies per file: some s= options map to a trusted CDN that
+        # serves plain HLS (e.g. megap.* or ncdn.imgnex.top -> bb.akirax.buzz),
+        # while others map to cdn.imgnex.top which is Cloudflare-blocked for
+        # scripts. try each option and keep the first master that actually
+        # fetches a playable playlist.
+        _chosen=""
+        for _sopt in s=tcdn s=bcdn; do
+            _src="$(anikoto_curl "${_host}/stream/getSources?id=${_file_id}&type=${_rtype}&${_sopt}")"
+            [ -z "$_src" ] && continue
+            _m3u8="$(printf '%s' "$_src" | sed -nE 's|.*"sources":\{?"file":"([^"]*)".*|\1|p' | sed 's|\\/|/|g')"
+            [ -z "$_m3u8" ] && _m3u8="$(printf '%s' "$_src" | sed -nE 's|.*"file":"([^"]*\.m3u8[^"]*)".*|\1|p' | sed 's|\\/|/|g')"
+            [ -z "$_m3u8" ] && _m3u8="$(decrypt_anikoto_enc "$_src")"
+            [ -z "$_m3u8" ] && continue
+            # single-shot probe: a Cloudflare challenge is deterministic, retrying
+            # won't help and would just add seconds of backoff
+            _master_body="$($curl_exe -sL --max-time 15 -A "$agent" -e "${_host}/" "$_m3u8" 2>/dev/null | tr -d '\r')"
+            if printf '%s' "$_master_body" | grep -qE '#EXT-X-STREAM-INF|#EXTINF'; then
+                _chosen="$_m3u8"
+                anikoto_master_body="$_master_body"
+                anikoto_master_url="$_chosen"
+                break
+            fi
+        done
+        # plain getSources as a final attempt (some files only serve it that way)
+        if [ -z "$_chosen" ]; then
+            _src="$(anikoto_curl "${_host}/stream/getSources?id=${_file_id}&type=${_rtype}")"
+            if [ -n "$_src" ]; then
+                _m3u8="$(printf '%s' "$_src" | sed -nE 's|.*"sources":\{?"file":"([^"]*)".*|\1|p' | sed 's|\\/|/|g')"
+                [ -z "$_m3u8" ] && _m3u8="$(printf '%s' "$_src" | sed -nE 's|.*"file":"([^"]*\.m3u8[^"]*)".*|\1|p' | sed 's|\\/|/|g')"
+                [ -z "$_m3u8" ] && _m3u8="$(decrypt_anikoto_enc "$_src")"
+                if [ -n "$_m3u8" ]; then
+                    _master_body="$($curl_exe -sL --max-time 15 -A "$agent" -e "${_host}/" "$_m3u8" 2>/dev/null | tr -d '\r')"
+                    if printf '%s' "$_master_body" | grep -qE '#EXT-X-STREAM-INF|#EXTINF'; then
+                        _chosen="$_m3u8"
+                        anikoto_master_body="$_master_body"
+                        anikoto_master_url="$_chosen"
+                    fi
+                fi
+            fi
+        fi
+        [ -z "$_chosen" ] && continue
+        anikoto_m3u8="$_chosen"
         anikoto_referer="$_host"
         case "$_embed_url" in
             *vidtube*|*akirax*) anikoto_direct=1 ;;
@@ -637,7 +672,11 @@ get_episode_url() {
     links=""
 
     if get_anikoto_m3u8 "$id" "$ep_no"; then
-        _m3u8_content="$(anikoto_curl_raw -e "${anikoto_referer}/" "$anikoto_m3u8")"
+        if [ "$anikoto_master_url" = "$anikoto_m3u8" ] && [ -n "$anikoto_master_body" ]; then
+            _m3u8_content="$anikoto_master_body"
+        else
+            _m3u8_content="$(anikoto_curl_raw -e "${anikoto_referer}/" "$anikoto_m3u8")"
+        fi
         if printf '%s' "$_m3u8_content" | grep -q "EXTM3U"; then
             _base="$(printf '%s' "$anikoto_m3u8" | sed 's|[^/]*$||')"
             links="$(printf '%s' "$_m3u8_content" | sed 's|^#EXT-X-STREAM.*x||g; s|,.*|p|g; /^#/d; $!N; s|\n| >|; /EXT-X-I-FRAME/d' | sort -nr)"
