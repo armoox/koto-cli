@@ -163,6 +163,7 @@ where_mpv() {
 cleanup() {
     tput sgr0               # clears colors
     rm -f "${histfile}.new" # remove temp logfile
+    rm -f "${TMPDIR:-/tmp}"/anikoto-sub-file-* 2>/dev/null
     anikoto_feed_cleanup
 }
 
@@ -360,7 +361,7 @@ anikoto_pick_subtitle() {
     _tr="$(printf '%s' "$_src" | sed -nE 's|.*"tracks":\[([^]]*)\].*|\1|p')"
     [ -z "$_tr" ] && return 1
     _tf="$(mktemp "${TMPDIR:-/tmp}/anikoto-sub-XXXXXX")" || return 1
-    printf '%s' "$_tr" | sed 's|},{|}\n{|g' > "$_tf"
+    printf '%s\n' "$_tr" | sed 's|},{|}\n{|g' > "$_tf"
     _a="" _al="" _d="" _dl="" _e="" _el="" _de="" _del=""
     while IFS= read -r _obj; do
         [ -n "$_obj" ] || continue
@@ -733,7 +734,23 @@ get_episode_url() {
     # soft subs come from megaplay's getSources "tracks": hand the best VTT to
     # the player via --sub-file (mpv/vlc fetch it themselves with the referrer)
     anikoto_sub_flag=""
-    [ -n "$anikoto_sub_url" ] && anikoto_sub_flag="--sub-file=$anikoto_sub_url"
+    if [ -n "$anikoto_sub_url" ]; then
+        # mpv does not send a Referer when fetching an external --sub-file, so
+        # the CDN 403s it. grab the VTT ourselves with referer+UA instead and
+        # hand the player a local file. fall back to the remote URL if we can't.
+        _sub_tmp="$(mktemp "${TMPDIR:-/tmp}/anikoto-sub-file-XXXXXX" 2>/dev/null)"
+        if [ -n "$_sub_tmp" ]; then
+            $curl_exe -sL --max-time 20 -A "$agent" -e "${anikoto_referer}/" -o "$_sub_tmp" "$anikoto_sub_url" 2>/dev/null
+            if [ -s "$_sub_tmp" ] && { head -c 8 "$_sub_tmp" | grep -qi 'WEBVTT'; }; then
+                anikoto_sub_flag="--sub-file=$_sub_tmp"
+            else
+                rm -f "$_sub_tmp"
+                anikoto_sub_flag="--sub-file=$anikoto_sub_url"
+            fi
+        else
+            anikoto_sub_flag="--sub-file=$anikoto_sub_url"
+        fi
+    fi
     if printf "%s" "$ep_list" | grep -q "^$ep_no$"; then
         [ -z "$episode" ] && die "No valid sources found for episode $ep_no"
     else
