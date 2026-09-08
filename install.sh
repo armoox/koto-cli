@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-REPO="VVAT3R/koto-cli"
+REPO="armoox/koto-cli"
 BRANCH="main"
 RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 

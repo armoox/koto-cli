@@ -42,5 +42,5 @@ Contacting the maintainer
 </h2>
 <br>
 
-Begin by making a GitHub issue on the [koto-cli repository](https://github.com/VVAT3R/koto-cli/issues)
+Begin by making a GitHub issue on the [koto-cli repository](https://github.com/armoox/koto-cli/issues)
 </div>

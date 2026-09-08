@@ -3,8 +3,8 @@
   <p><strong>Watch anime from your terminal.</strong></p>
 
   <p>
-    <a href="https://github.com/VVAT3R/koto-cli">GitHub</a> •
-    <a href="https://github.com/VVAT3R/koto-cli/issues">Issues</a>
+    <a href="https://github.com/armoox/koto-cli">GitHub</a> •
+    <a href="https://github.com/armoox/koto-cli/issues">Issues</a>
   </p>
 
   <p>
