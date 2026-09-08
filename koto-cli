@@ -924,17 +924,14 @@ play_episode() {
             [ -n "$_mpv_socket" ] && rm -f "$_mpv_socket"
             [ -n "$_mpv_socket" ] && _mpv_args="--input-ipc-server=$_mpv_socket"
             [ -n "$_resume_pos" ] && [ "$_resume_pos" != "0" ] && _mpv_args="$_mpv_args --start=$_resume_pos"
-            # the local feed plays from plain files with a fixed VOD playlist, so
             # keep mpv's own stream cache enabled (cache=yes + a large cache-secs
             # makes the OSC render a visible "buffered ahead" line/cached time as
-            # the feeder downloads) but hold the demuxer read-ahead to ~60s: the
-            # feeder stays ahead, and a much bigger read-ahead would drive mpv
-            # into segments the feeder hasn't written yet (ffmpeg then deems them
-            # failed and skips ahead). keep hr-seek so seeking into
-            # already-downloaded segments works.
-            if [ -n "$anikoto_feed_m3u8" ]; then
-                _mpv_args="$_mpv_args --hr-seek=absolute --cache=yes --cache-secs=900 --demuxer-max-bytes=50MiB --demuxer-max-back-bytes=0 --demuxer-readahead-secs=60"
-            fi
+            # the stream downloads) but hold the demuxer read-ahead to ~60s so it
+            # never drives into segments that aren't available yet (ffmpeg would
+            # deem them failed and skip ahead). apply on direct streams too so the
+            # player always shows the pre-buffer progress. keep hr-seek so seeking
+            # works.
+            _mpv_args="$_mpv_args --hr-seek=absolute --cache=yes --cache-secs=900 --demuxer-max-bytes=50MiB --demuxer-max-back-bytes=0 --demuxer-readahead-secs=60"
             if [ "$no_detach" = 0 ]; then
                 nohup $player_function $_mpv_args $skip_flag --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" "$episode" $refr_flag $anikoto_sub_flag $player_extra_flags >/dev/null 2>&1 &
             else
@@ -956,10 +953,7 @@ play_episode() {
         flatpak_mpv)
             _flatpak_resume=""
             [ -n "$_resume_pos" ] && [ "$_resume_pos" != "0" ] && _flatpak_resume="--start=$_resume_pos"
-            _flatpak_cache=""
-            if [ -n "$anikoto_feed_m3u8" ]; then
-                _flatpak_cache="--hr-seek=absolute --cache=yes --cache-secs=900 --demuxer-max-bytes=50MiB --demuxer-max-back-bytes=0 --demuxer-readahead-secs=60"
-            fi
+            _flatpak_cache="--hr-seek=absolute --cache=yes --cache-secs=900 --demuxer-max-bytes=50MiB --demuxer-max-back-bytes=0 --demuxer-readahead-secs=60"
             if [ "$no_detach" = 0 ]; then
                 nohup flatpak run io.mpv.Mpv --input-ipc-server="$_mpv_socket" $_flatpak_resume $_flatpak_cache --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" $skip_flag "$episode" $refr_flag $anikoto_sub_flag $player_extra_flags >/dev/null 2>&1 &
             else
