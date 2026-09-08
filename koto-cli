@@ -330,6 +330,22 @@ anikoto_server_links() {
     printf '%s' "$_all"
 }
 
+# megaplay hides the stream URL in an "enc" field encrypted with AES-256-CBC
+# (fixed key/iv, base64url). decrypt it back to the plain m3u8 URL.
+anikoto_enc_key="693f4c4d5441783051362c3a7d35305500000000000000000000000000000000"
+anikoto_enc_iv="57303b3237546f6155706c5f50252763"
+decrypt_anikoto_enc() {
+    _src="$1"
+    _enc="$(printf '%s' "$_src" | sed -nE 's|.*"enc":"([^"]*)".*|\1|p')"
+    [ -z "$_enc" ] && return 1
+    command -v openssl >/dev/null 2>&1 || { warn "openssl not found - needed to decrypt stream sources"; return 1; }
+    _b64="$(printf '%s' "$_enc" | sed 's/-/+/g; s/_/\//g')"
+    while [ $(( ${#_b64} % 4 )) -ne 0 ]; do _b64="${_b64}="; done
+    _dec="$(printf '%s' "$_b64" | openssl enc -d -aes-256-cbc -a -A -K "$anikoto_enc_key" -iv "$anikoto_enc_iv" 2>/dev/null)"
+    [ -n "$_dec" ] || return 1
+    printf '%s' "$_dec" | sed -nE 's|.*"file":"([^"]*)".*|\1|p' | sed 's|\\/|/|g'
+}
+
 get_anikoto_m3u8() {
     _slug="$1"
     _ep_no="$2"
@@ -407,6 +423,7 @@ get_anikoto_m3u8() {
         [ -z "$_src" ] && continue
         _m3u8="$(printf '%s' "$_src" | sed -nE 's|.*"sources":\{?"file":"([^"]*)".*|\1|p' | sed 's|\\/|/|g')"
         [ -z "$_m3u8" ] && _m3u8="$(printf '%s' "$_src" | sed -nE 's|.*"file":"([^"]*\.m3u8[^"]*)".*|\1|p' | sed 's|\\/|/|g')"
+        [ -z "$_m3u8" ] && _m3u8="$(decrypt_anikoto_enc "$_src")"
         [ -z "$_m3u8" ] && continue
         anikoto_m3u8="$_m3u8"
         anikoto_referer="$_host"
@@ -1005,6 +1022,7 @@ info "Checking dependencies..."
 dep_ch "curl"
 dep_ch "sed"
 dep_ch "grep"
+dep_ch "openssl"
 [ "$skip_intro" = 1 ] && dep_ch "ani-skip"
 dep_ch "$menu_program"
 case "$player_function" in
