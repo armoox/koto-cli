@@ -588,11 +588,42 @@ anikoto_feed_stream() {
         # start new downloads while we have slots and URLs left
         while [ "$_batch" -lt "$_max" ] && [ $# -gt 0 ]; do
             _u="$1"; shift
+            # each segment gets up to 3 download attempts (a transient CDN blip
+            # used to drop the chunk forever -> mpv skipped over it). after
+            # stripping the junk prefix the result must start on a TS sync byte
+            # (0x47); if the segment uses a different junk length than the probe
+            # found, re-scan its real offset from the raw bytes.
             (
-                curl -sL --max-time 60 -A "$agent" -e "${anikoto_referer}/" "$_u" \
-                    | tail -c +$((_off + 1)) > "$anikoto_feed_dir/seg${_i}.ts.part"
-                [ -s "$anikoto_feed_dir/seg${_i}.ts.part" ] \
-                    && mv -f "$anikoto_feed_dir/seg${_i}.ts.part" "$anikoto_feed_dir/seg${_i}.ts" 2>/dev/null
+                _attempt=0
+                while [ "$_attempt" -lt 3 ]; do
+                    _attempt=$((_attempt + 1))
+                    $curl_exe -sL --max-time 30 -A "$agent" -e "${anikoto_referer}/" "$_u" \
+                        > "$anikoto_feed_dir/raw${_i}.bin" 2>/dev/null
+                    if [ -s "$anikoto_feed_dir/raw${_i}.bin" ]; then
+                        tail -c +$((_off + 1)) "$anikoto_feed_dir/raw${_i}.bin" > "$anikoto_feed_dir/seg${_i}.ts.part" 2>/dev/null
+                        _sb="$(od -An -N1 -t u1 "$anikoto_feed_dir/seg${_i}.ts.part" 2>/dev/null | tr -d ' ')"
+                        if [ -s "$anikoto_feed_dir/seg${_i}.ts.part" ] && [ "$_sb" = 71 ]; then
+                            rm -f "$anikoto_feed_dir/raw${_i}.bin"; break
+                        fi
+                        rm -f "$anikoto_feed_dir/seg${_i}.ts.part"
+                        _so="$(detect_ts_offset "$anikoto_feed_dir/raw${_i}.bin")"
+                        if [ -n "$_so" ]; then
+                            tail -c +$((_so + 1)) "$anikoto_feed_dir/raw${_i}.bin" > "$anikoto_feed_dir/seg${_i}.ts.part" 2>/dev/null
+                            _sb="$(od -An -N1 -t u1 "$anikoto_feed_dir/seg${_i}.ts.part" 2>/dev/null | tr -d ' ')"
+                            if [ -s "$anikoto_feed_dir/seg${_i}.ts.part" ] && [ "$_sb" = 71 ]; then
+                                rm -f "$anikoto_feed_dir/raw${_i}.bin"; break
+                            fi
+                            rm -f "$anikoto_feed_dir/seg${_i}.ts.part"
+                        fi
+                        rm -f "$anikoto_feed_dir/raw${_i}.bin"
+                    fi
+                    [ "$_attempt" -lt 3 ] && sleep "$_attempt"
+                done
+                if [ -s "$anikoto_feed_dir/seg${_i}.ts.part" ]; then
+                    mv -f "$anikoto_feed_dir/seg${_i}.ts.part" "$anikoto_feed_dir/seg${_i}.ts" 2>/dev/null
+                else
+                    rm -f "$anikoto_feed_dir/seg${_i}.ts.part"
+                fi
             ) &
             _pids="$_pids $!"
             _segs="$_segs $anikoto_feed_dir/seg${_i}.ts"
