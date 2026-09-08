@@ -182,11 +182,19 @@ select_quality() {
 
     # non-direct hosts (megaplay etc.) used to ship obfuscated segments that
     # the player can't handle, and the local feed stripped the junk per
-    # segment. the CDNs now deliver clean MPEG-TS, so probe the first segment
-    # and only use the feed when a real junk prefix is detected
+    # segment. imgnex/akirax now deliver clean MPEG-TS, but the segments are
+    # disguised as .png files in the playlist - ffmpeg's HLS demuxer can
+    # restart mid-stream over a remote .png playlist and cause mpv to jump
+    # forward mid-episode. so: feed anything that has a junk prefix OR comes
+    # from one of those disguised-CDN hosts; only truly clean third-party
+    # streams play directly.
     if [ "$anikoto_direct" != 1 ] && [ -n "$episode" ]; then
+        _force_feed=0
+        case "$episode" in
+            *imgnex*|*akirax*) _force_feed=1 ;;
+        esac
         _probe_off="$(probe_anikoto_offset "$episode")"
-        if [ -z "$_probe_off" ] || [ "$_probe_off" = "0" ]; then
+        if [ -z "$_probe_off" ] || { [ "$_probe_off" = "0" ] && [ "$_force_feed" != 1 ]; }; then
             anikoto_direct=1
             [ -n "$anikoto_feed_pid" ] && anikoto_feed_cleanup
         else
@@ -194,7 +202,7 @@ select_quality() {
                 anikoto_feed_cleanup
             fi
             if [ -z "$anikoto_feed_pid" ]; then
-                start_anikoto_fifo "$episode" "$_probe_off" || { warn "Failed to prepare local feed for stream"; episode=""; return 1; }
+                start_anikoto_fifo "$episode" "${_probe_off:-0}" || { warn "Failed to prepare local feed for stream"; episode=""; return 1; }
             fi
             anikoto_feed_variant="$episode"
             episode="$anikoto_feed_m3u8"
