@@ -213,7 +213,7 @@ anikoto_curl() {
             -H 'X-Requested-With: XMLHttpRequest' \
             --max-time 15 "$@" 2>/dev/null | tr -d '\r')"
         if [ -n "$_result" ]; then
-            printf '%s' "$_result" | grep -qi "Just a moment" && { _result=""; }
+            printf '%s' "$_result" | grep -qiE "Just a moment|Attention Required!|403 Forbidden" && { _result=""; }
             [ -n "$_result" ] && printf '%s' "$_result" && return 0
         fi
         _retries=$((_retries - 1))
@@ -231,7 +231,7 @@ anikoto_curl_raw() {
         _result="$($curl_exe -sL -A "$agent" \
             --max-time 15 "$@" 2>/dev/null | tr -d '\r')"
         if [ -n "$_result" ]; then
-            printf '%s' "$_result" | grep -qi "Just a moment" && { _result=""; }
+            printf '%s' "$_result" | grep -qiE "Just a moment|Attention Required!|403 Forbidden" && { _result=""; }
             [ -n "$_result" ] && printf '%s' "$_result" && return 0
         fi
         _retries=$((_retries - 1))
@@ -419,7 +419,11 @@ get_anikoto_m3u8() {
         [ -z "$_file_id" ] && _file_id="$(printf '%s' "$_embed_page" | grep -oE 'data-id="[0-9]+"' | head -1 | grep -oE '[0-9]+')"
         [ -z "$_file_id" ] && continue
         _host="$(printf '%s' "$_embed_url" | sed -E 's|^(https?://[^/]+).*|\1|')"
-        _src="$(anikoto_curl "${_host}/stream/getSources?id=${_file_id}&type=${_rtype}")"
+        # megap.norami.top (s=tcdn) serves a plain clean HLS playlist; the default
+        # cdn (imgnex.top) is Cloudflare-blocked for scripts and/or token-obfuscated.
+        # request the trusted-CDN variant first, fall back to the default.
+        _src="$(anikoto_curl "${_host}/stream/getSources?id=${_file_id}&type=${_rtype}&s=tcdn")"
+        [ -z "$_src" ] && _src="$(anikoto_curl "${_host}/stream/getSources?id=${_file_id}&type=${_rtype}")"
         [ -z "$_src" ] && continue
         _m3u8="$(printf '%s' "$_src" | sed -nE 's|.*"sources":\{?"file":"([^"]*)".*|\1|p' | sed 's|\\/|/|g')"
         [ -z "$_m3u8" ] && _m3u8="$(printf '%s' "$_src" | sed -nE 's|.*"file":"([^"]*\.m3u8[^"]*)".*|\1|p' | sed 's|\\/|/|g')"
