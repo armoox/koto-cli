@@ -572,37 +572,6 @@ anikoto_feed_fifo=0
 anikoto_probe_pl=""
 anikoto_probe_url=""
 
-# rewrites the local playlist so it only ever lists segments that already
-# exist: rows are appended as the feeder writes each .ts, and #EXT-X-ENDLIST
-# appears only once the whole episode has been cached. ffmpeg's HLS demuxer
-# otherwise tries to open a not-yet-written segment file, decides the segment
-# "failed too many times" and *skips forward* past the end of the feed (which
-# mpv surfaces as a mid-episode jump; forcing a big read-ahead cache makes
-# mpv chase the frontier and freeze its buffer display at the cache cap)
-anikoto_feed_grow() {
-    _dir="$1"
-    [ "$anikoto_feed_fifo" -eq 1 ] && return 0
-    _total="$(wc -l < "$_dir/extinf.txt" 2>/dev/null)"
-    [ -z "$_total" ] && return 0
-    _done=0
-    while [ "$_done" -lt "$_total" ] && [ -s "$_dir/seg${_done}.ts" ]; do
-        _done=$((_done + 1))
-    done
-    _tmp="$_dir/pl.$$.tmp.m3u8"
-    {
-        printf '%s\n' "#EXTM3U" "#EXT-X-VERSION:3" "#EXT-X-TARGETDURATION:4" "#EXT-X-MEDIA-SEQUENCE:0"
-        _k=0
-        while [ "$_k" -lt "$_done" ]; do
-            _ext="$(sed -n "$((_k + 1))p" "$_dir/extinf.txt")"
-            printf '#EXTINF:%s\n' "$_ext"
-            printf '%s\n' "$_dir/seg${_k}.ts"
-            _k=$((_k + 1))
-        done
-        [ "$_done" -ge "$_total" ] && printf '%s\n' "#EXT-X-ENDLIST"
-    } > "$_tmp"
-    mv -f "$_tmp" "$_dir/playlist.m3u8" 2>/dev/null
-}
-
 # background feeder: downloads each obfuscated segment, strips the junk prefix
 # and writes clean MPEG-TS so the player can read it (pure POSIX shell).
 # a sliding window keeps up to 3 downloads active at all times — when one
@@ -622,7 +591,6 @@ anikoto_feed_stream() {
     _pids=""
     _segs=""
     _batch=0
-    _pruned=0
 
     while true; do
         # start new downloads while we have slots and URLs left
@@ -673,7 +641,6 @@ anikoto_feed_stream() {
 
         # done once no URLs remain and every started download has finished
         if [ $# -eq 0 ] && [ -z "$_pids" ]; then
-            anikoto_feed_grow "$_dir"
             break
         fi
         sleep 0.2
@@ -698,20 +665,10 @@ anikoto_feed_stream() {
             else
                 wait "$_p" 2>/dev/null
                 _batch=$((_batch - 1))
-                _pruned=1
             fi
         done
         _pids="${_np# }"
         _segs="${_ns# }"
-
-        # publish whichever front segments just landed: the local playlist only
-        # lists segments that already exist (no ENDLIST until the episode has
-        # finished caching), so ffmpeg's HLS demuxer never hits a missing file
-        # and "skips" forward over the end of the feed
-        if [ "$_pruned" = 1 ]; then
-            anikoto_feed_grow "$_dir"
-            _pruned=0
-        fi
     done
 }
 
@@ -732,40 +689,22 @@ start_anikoto_fifo() {
     anikoto_feed_fifo=0
     [ "$player_function" = "download" ] && anikoto_feed_fifo=1
     : > "$anikoto_feed_dir/segments.txt"
-    : > "$anikoto_feed_dir/extinf.txt"
     _i=0
-    _ext="4.000000,"
     printf '%s\n' "$_pl" | while IFS= read -r _line; do
         _s="$(printf '%s\n' "$_line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
         case "$_s" in
-            \#EXTINF:*)
-                _ext="${_s#\#EXTINF:}"
-                [ "$anikoto_feed_fifo" = 1 ] && printf '%s\n' "$_line"
-                ;;
-            \#*)
-                [ "$anikoto_feed_fifo" = 1 ] && printf '%s\n' "$_line"
-                ;;
+            \#*) printf '%s\n' "$_line" ;;
             *)
-                printf '%s\n' "$_ext" >> "$anikoto_feed_dir/extinf.txt"
+                printf '%s\n' "$anikoto_feed_dir/seg${_i}.ts"
+                [ "$anikoto_feed_fifo" = 1 ] && mkfifo "$anikoto_feed_dir/seg${_i}.ts"
                 printf '%s\n' "$_s" >> "$anikoto_feed_dir/segments.txt"
-                if [ "$anikoto_feed_fifo" = 1 ]; then
-                    printf '%s\n' "$anikoto_feed_dir/seg${_i}.ts"
-                    mkfifo "$anikoto_feed_dir/seg${_i}.ts"
-                fi
                 _i=$((_i + 1))
                 ;;
         esac
     done > "$anikoto_feed_dir/playlist.m3u8"
 
-    if [ ! -s "$anikoto_feed_dir/segments.txt" ] \
-        || { [ "$anikoto_feed_fifo" != 1 ] && [ ! -s "$anikoto_feed_dir/extinf.txt" ]; }; then
-        warn "No segments in HLS playlist for stream"
-        rm -rf "$anikoto_feed_dir"
-        anikoto_feed_dir=""
-        return 1
-    fi
-
-    [ "$anikoto_feed_fifo" != 1 ] && anikoto_feed_grow "$anikoto_feed_dir"
+    [ ! -s "$anikoto_feed_dir/segments.txt" ] \
+        && { warn "No segments in HLS playlist for stream"; rm -rf "$anikoto_feed_dir"; anikoto_feed_dir=""; return 1; }
 
     anikoto_feed_m3u8="$anikoto_feed_dir/playlist.m3u8"
     _pidfile="$anikoto_feed_dir/feed.pid"
@@ -786,16 +725,16 @@ start_anikoto_fifo() {
         return 1
     fi
 
-    # playback: buffer the first couple of segments (~7s) so mpv starts fast
-    # without stalling on a missing initial segment
+    # playback: buffer the first few segments (~15s) so mpv starts fast and its
+    # modest read-ahead can never reach a segment the feeder hasn't written yet
     if [ "$anikoto_feed_fifo" != 1 ]; then
         _waits=0
         while [ "$_waits" -lt 150 ]; do
-            [ -s "$anikoto_feed_dir/seg0.ts" ] && [ -s "$anikoto_feed_dir/seg1.ts" ] && break
+            [ -s "$anikoto_feed_dir/seg0.ts" ] && [ -s "$anikoto_feed_dir/seg1.ts" ] \
+                && [ -s "$anikoto_feed_dir/seg2.ts" ] && [ -s "$anikoto_feed_dir/seg3.ts" ] && break
             sleep 0.2
             _waits=$((_waits + 1))
         done
-        anikoto_feed_grow "$anikoto_feed_dir"
     fi
 }
 
@@ -985,13 +924,14 @@ play_episode() {
             [ -n "$_mpv_socket" ] && rm -f "$_mpv_socket"
             [ -n "$_mpv_socket" ] && _mpv_args="--input-ipc-server=$_mpv_socket"
             [ -n "$_resume_pos" ] && [ "$_resume_pos" != "0" ] && _mpv_args="$_mpv_args --start=$_resume_pos"
-            # the local feed only advertises segments that already exist
-            # (grows live-style), so forcing a big read-ahead here would just
-            # make mpv chase the feed frontier and freeze its buffer display
-            # at the cache cap; the default demuxer read-ahead is plenty.
-            # keep hr-seek so seeking into downloaded segments still works.
+            # the local feed plays from plain files with a fixed VOD playlist, so keep
+            # mpv's own stream cache off (nothing to gain) but hold the demuxer
+            # read-ahead to ~5s: the feeder keeps several segments ahead, and a
+            # bigger read-ahead would just drive mpv into segments the feeder
+            # hasn't written yet (ffmpeg then deems them failed and skips ahead).
+            # keep hr-seek so seeking into already-downloaded segments works.
             if [ -n "$anikoto_feed_m3u8" ]; then
-                _mpv_args="$_mpv_args --hr-seek=absolute --demuxer-max-bytes=50MiB --demuxer-max-back-bytes=0"
+                _mpv_args="$_mpv_args --hr-seek=absolute --demuxer-max-bytes=50MiB --demuxer-max-back-bytes=0 --demuxer-readahead-secs=5"
             fi
             if [ "$no_detach" = 0 ]; then
                 nohup $player_function $_mpv_args $skip_flag --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" "$episode" $refr_flag $anikoto_sub_flag $player_extra_flags >/dev/null 2>&1 &
@@ -1016,7 +956,7 @@ play_episode() {
             [ -n "$_resume_pos" ] && [ "$_resume_pos" != "0" ] && _flatpak_resume="--start=$_resume_pos"
             _flatpak_cache=""
             if [ -n "$anikoto_feed_m3u8" ]; then
-                _flatpak_cache="--hr-seek=absolute --demuxer-max-bytes=50MiB --demuxer-max-back-bytes=0"
+                _flatpak_cache="--hr-seek=absolute --demuxer-max-bytes=50MiB --demuxer-max-back-bytes=0 --demuxer-readahead-secs=5"
             fi
             if [ "$no_detach" = 0 ]; then
                 nohup flatpak run io.mpv.Mpv --input-ipc-server="$_mpv_socket" $_flatpak_resume $_flatpak_cache --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" $skip_flag "$episode" $refr_flag $anikoto_sub_flag $player_extra_flags >/dev/null 2>&1 &
