@@ -460,6 +460,9 @@ probe_anikoto_offset() {
     _variant_url="$1"
     _pl="$(anikoto_curl_raw -e "${anikoto_referer}/" "$_variant_url")"
     printf '%s' "$_pl" | grep -q "EXTM3U" || return 1
+    # cache the playlist so start_anikoto_fifo doesn't have to re-fetch it
+    anikoto_probe_pl="$_pl"
+    anikoto_probe_url="$_variant_url"
     _first_seg="$(printf '%s' "$_pl" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^#' | head -n1)"
     [ -n "$_first_seg" ] || return 1
     case "$_first_seg" in
@@ -479,6 +482,8 @@ anikoto_feed_dir=""
 anikoto_feed_m3u8=""
 anikoto_feed_variant=""
 anikoto_feed_fifo=0
+anikoto_probe_pl=""
+anikoto_probe_url=""
 
 # background feeder: downloads each obfuscated segment, strips the junk prefix
 # and writes clean MPEG-TS so the player can read it (pure POSIX shell).
@@ -497,54 +502,55 @@ anikoto_feed_stream() {
     done < "$_dir/segments.txt"
     set -- $_urls
     _pids=""
+    _segs=""
     _batch=0
 
     while true; do
         # start new downloads while we have slots and URLs left
         while [ "$_batch" -lt "$_max" ] && [ $# -gt 0 ]; do
-            _curl_url="$1"; shift
-            (curl -sL --max-time 60 -A "$agent" -e "${anikoto_referer}/" "$_curl_url" \
-                | tail -c +$((_off + 1)) > "$_dir/seg${_i}.ts.part") &
+            _u="$1"; shift
+            (
+                curl -sL --max-time 60 -A "$agent" -e "${anikoto_referer}/" "$_u" \
+                    | tail -c +$((_off + 1)) > "$anikoto_feed_dir/seg${_i}.ts.part"
+                [ -s "$anikoto_feed_dir/seg${_i}.ts.part" ] \
+                    && mv -f "$anikoto_feed_dir/seg${_i}.ts.part" "$anikoto_feed_dir/seg${_i}.ts" 2>/dev/null
+            ) &
             _pids="$_pids $!"
+            _segs="$_segs $anikoto_feed_dir/seg${_i}.ts"
             _batch=$((_batch + 1))
             _i=$((_i + 1))
         done
 
-        # wait for any one download to finish
-        _found=0
-        for _p in $_pids; do
-            kill -0 "$_p" 2>/dev/null && { _found=1; break; }
-        done
-        [ "$_found" = 0 ] && break
+        # done once no URLs remain and every started download has finished
+        if [ $# -eq 0 ] && [ -z "$_pids" ]; then
+            break
+        fi
         sleep 0.2
 
-        # clean up completed PIDs
-        _new_pids=""
-        for _p in $_pids; do
+        # prune finished PIDs; each subshell mv's its own segment as soon as it's
+        # complete, so earlier segments are visible to the player immediately
+        _np=""
+        _ns=""
+        _rest_p="${_pids# }"
+        _rest_s="${_segs# }"
+        while [ -n "$_rest_p" ]; do
+            _p="${_rest_p%% *}"
+            _s="${_rest_s%% *}"
+            case "$_rest_p" in
+                *" "*) _rest_p="${_rest_p#* }"
+                       _rest_s="${_rest_s#* }" ;;
+                *)     _rest_p="" ; _rest_s="" ;;
+            esac
             if kill -0 "$_p" 2>/dev/null; then
-                _new_pids="$_new_pids $_p"
+                _np="$_np $_p"
+                _ns="$_ns $_s"
             else
                 wait "$_p" 2>/dev/null
                 _batch=$((_batch - 1))
             fi
         done
-        _pids="$_new_pids"
-
-        # move completed .part files when no downloads are active
-        if [ -z "$_pids" ]; then
-            for _f in "$_dir"/seg*.ts.part; do
-                [ -f "$_f" ] || continue
-                _seg="${_f%.part}"
-                [ -f "$_seg" ] || mv "$_f" "$_seg" 2>/dev/null
-            done
-        fi
-    done
-
-    # move any remaining .part files
-    for _f in "$_dir"/seg*.ts.part; do
-        [ -f "$_f" ] || continue
-        _seg="${_f%.part}"
-        [ -f "$_seg" ] || mv "$_f" "$_seg" 2>/dev/null
+        _pids="${_np# }"
+        _segs="${_ns# }"
     done
 }
 
@@ -555,7 +561,11 @@ anikoto_feed_stream() {
 start_anikoto_fifo() {
     _variant_url="$1"
     _off="${2:-252}"
-    _pl="$(anikoto_curl_raw -e "${anikoto_referer}/" "$_variant_url")"
+    if [ "$anikoto_probe_url" = "$_variant_url" ] && [ -n "$anikoto_probe_pl" ]; then
+        _pl="$anikoto_probe_pl"
+    else
+        _pl="$(anikoto_curl_raw -e "${anikoto_referer}/" "$_variant_url")"
+    fi
     printf '%s' "$_pl" | grep -q "EXTM3U" || { warn "Failed to fetch HLS playlist for stream"; return 1; }
     anikoto_feed_dir="$(mktemp -d "${TMPDIR:-/tmp}/anikoto-fifo-XXXXXX")" || return 1
     anikoto_feed_fifo=0
@@ -583,8 +593,13 @@ start_anikoto_fifo() {
     # daemonize (orphan it) so the shell's `wait` doesn't block on it
     (anikoto_feed_stream "$anikoto_feed_dir" "$_off" &
         printf '%s' "$!" >"$_pidfile")
-    sleep 1
-    anikoto_feed_pid="$(cat "$_pidfile" 2>/dev/null)"
+    _waits=0
+    while [ "$_waits" -lt 25 ]; do
+        anikoto_feed_pid="$(cat "$_pidfile" 2>/dev/null)"
+        [ -n "$anikoto_feed_pid" ] && break
+        sleep 0.2
+        _waits=$((_waits + 1))
+    done
     if [ -z "$anikoto_feed_pid" ]; then
         warn "Failed to start stream feeder"
         rm -rf "$anikoto_feed_dir"
@@ -592,19 +607,13 @@ start_anikoto_fifo() {
         return 1
     fi
 
-    # playback: buffer the first few segments so mpv starts without stalling
+    # playback: buffer the first couple of segments (~7s) so mpv starts fast
+    # without stalling on a missing initial segment
     if [ "$anikoto_feed_fifo" != 1 ]; then
-        _n=0
         _waits=0
-        while [ "$_waits" -lt 60 ]; do
-            _n=0
-            _j=0
-            while [ "$_j" -lt 5 ]; do
-                [ -s "$anikoto_feed_dir/seg$_j.ts" ] && _n=$((_n + 1))
-                _j=$((_j + 1))
-            done
-            [ "$_n" -ge 5 ] && break
-            sleep 1
+        while [ "$_waits" -lt 150 ]; do
+            [ -s "$anikoto_feed_dir/seg0.ts" ] && [ -s "$anikoto_feed_dir/seg1.ts" ] && break
+            sleep 0.2
             _waits=$((_waits + 1))
         done
     fi
