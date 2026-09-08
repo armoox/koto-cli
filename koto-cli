@@ -568,7 +568,6 @@ anikoto_feed_pid=""
 anikoto_feed_dir=""
 anikoto_feed_m3u8=""
 anikoto_feed_variant=""
-anikoto_feed_fifo=0
 anikoto_probe_pl=""
 anikoto_probe_url=""
 
@@ -576,8 +575,11 @@ anikoto_probe_url=""
 # and writes clean MPEG-TS so the player can read it (pure POSIX shell).
 # a sliding window keeps up to 3 downloads active at all times — when one
 # finishes the next starts immediately so mpv always has fresh data to read;
-# each segment is written via .part + atomic mv so a partial segment is never
-# visible, which lets mpv re-open segments for backward seeking
+# each segment is marked downloaded (segN.done), turned into segN.dl for a
+# pump that streams it through its fifo to unblock the player (a fifo open
+# can never "fail" on a segment that isn't downloaded yet, so mpv buffers
+# instead of closing), then the real file is renamed over the fifo so the
+# segment becomes seekable again
 anikoto_feed_stream() {
     _dir="$1"
     _off="$2"
@@ -590,6 +592,8 @@ anikoto_feed_stream() {
     set -- $_urls
     _pids=""
     _segs=""
+    _allsegs=""
+    _ppids=""
     _batch=0
 
     while true; do
@@ -628,25 +632,45 @@ anikoto_feed_stream() {
                     [ "$_attempt" -lt 3 ] && sleep "$_attempt"
                 done
                 if [ -s "$anikoto_feed_dir/seg${_i}.ts.part" ]; then
-                    mv -f "$anikoto_feed_dir/seg${_i}.ts.part" "$anikoto_feed_dir/seg${_i}.ts" 2>/dev/null
+                    mv -f "$anikoto_feed_dir/seg${_i}.ts.part" "$anikoto_feed_dir/seg${_i}.dl" 2>/dev/null
+                    : > "$anikoto_feed_dir/seg${_i}.done"
                 else
                     rm -f "$anikoto_feed_dir/seg${_i}.ts.part"
                 fi
             ) &
             _pids="$_pids $!"
             _segs="$_segs $anikoto_feed_dir/seg${_i}.ts"
+            _allsegs="$_allsegs $anikoto_feed_dir/seg${_i}.ts"
             _batch=$((_batch + 1))
             _i=$((_i + 1))
         done
 
-        # done once no URLs remain and every started download has finished
-        if [ $# -eq 0 ] && [ -z "$_pids" ]; then
+        # launch a "pump" for each segment that finished downloading: it streams
+        # the data THROUGH the fifo (which unblocks the player - a fifo open can
+        # never fail on a not-yet-downloaded segment, mpv just waits/buffers)
+        # then renames the real file over the fifo so the segment becomes
+        # seekable again
+        for _s in $_allsegs; do
+            _base="${_s%.ts}"
+            if [ -e "${_base}.dl" ] && [ ! -e "${_base}.pump" ] && [ -p "$_s" ]; then
+                mv -f "${_base}.dl" "${_base}.pump"
+                ( trap 'kill ${_cc:-0} 2>/dev/null; exit 0' TERM INT
+                  cat "${_base}.pump" > "$_s" 2>/dev/null &
+                  _cc=$!
+                  wait "$_cc" 2>/dev/null
+                  mv -f "${_base}.pump" "$_s" 2>/dev/null ) &
+                _ppids="$_ppids $!"
+            fi
+        done
+
+        # done once no URLs remain and every download AND every pump finished
+        if [ $# -eq 0 ] && [ -z "$_pids" ] && [ -z "$_ppids" ]; then
             break
         fi
         sleep 0.2
 
-        # prune finished PIDs; each subshell mv's its own segment as soon as it's
-        # complete, so earlier segments are visible to the player immediately
+        # prune finished download PIDs; each subshell drops its segment as
+        # segN.dl as soon as the download is complete
         _np=""
         _ns=""
         _rest_p="${_pids# }"
@@ -669,6 +693,23 @@ anikoto_feed_stream() {
         done
         _pids="${_np# }"
         _segs="${_ns# }"
+
+        # prune finished pump PIDs
+        _npp=""
+        _rest_pp="${_ppids# }"
+        while [ -n "$_rest_pp" ]; do
+            _pp="${_rest_pp%% *}"
+            case "$_rest_pp" in
+                *" "*) _rest_pp="${_rest_pp#* }" ;;
+                *)     _rest_pp="" ;;
+            esac
+            if kill -0 "$_pp" 2>/dev/null; then
+                _npp="$_npp $_pp"
+            else
+                wait "$_pp" 2>/dev/null
+            fi
+        done
+        _ppids="${_npp# }"
     done
 }
 
@@ -686,8 +727,6 @@ start_anikoto_fifo() {
     fi
     printf '%s' "$_pl" | grep -q "EXTM3U" || { warn "Failed to fetch HLS playlist for stream"; return 1; }
     anikoto_feed_dir="$(mktemp -d "${TMPDIR:-/tmp}/anikoto-fifo-XXXXXX")" || return 1
-    anikoto_feed_fifo=0
-    [ "$player_function" = "download" ] && anikoto_feed_fifo=1
     : > "$anikoto_feed_dir/segments.txt"
     _i=0
     printf '%s\n' "$_pl" | while IFS= read -r _line; do
@@ -696,7 +735,7 @@ start_anikoto_fifo() {
             \#*) printf '%s\n' "$_line" ;;
             *)
                 printf '%s\n' "$anikoto_feed_dir/seg${_i}.ts"
-                [ "$anikoto_feed_fifo" = 1 ] && mkfifo "$anikoto_feed_dir/seg${_i}.ts"
+                mkfifo "$anikoto_feed_dir/seg${_i}.ts"
                 printf '%s\n' "$_s" >> "$anikoto_feed_dir/segments.txt"
                 _i=$((_i + 1))
                 ;;
@@ -725,17 +764,19 @@ start_anikoto_fifo() {
         return 1
     fi
 
-    # playback: buffer the first few segments (~15s) so mpv starts fast and its
-    # modest read-ahead can never reach a segment the feeder hasn't written yet
-    if [ "$anikoto_feed_fifo" != 1 ]; then
-        _waits=0
-        while [ "$_waits" -lt 150 ]; do
-            [ -s "$anikoto_feed_dir/seg0.ts" ] && [ -s "$anikoto_feed_dir/seg1.ts" ] \
-                && [ -s "$anikoto_feed_dir/seg2.ts" ] && [ -s "$anikoto_feed_dir/seg3.ts" ] && break
-            sleep 0.2
-            _waits=$((_waits + 1))
-        done
-    fi
+    # playback: wait until the first few segments (~15s) are downloaded. each
+    # listed segment is a FIFO whose open blocks until its pump streams data
+    # into it, so mpv can never fail on a not-yet-downloaded segment (it just
+    # buffers instead of closing). waiting on the segN.done markers (persistent,
+    # set by the downloader itself and never removed) means mpv starts as soon
+    # as the first data actually exists, without racing the pump stage.
+    _waits=0
+    while [ "$_waits" -lt 150 ]; do
+        [ -e "$anikoto_feed_dir/seg0.done" ] && [ -e "$anikoto_feed_dir/seg1.done" ] \
+            && [ -e "$anikoto_feed_dir/seg2.done" ] && [ -e "$anikoto_feed_dir/seg3.done" ] && break
+        sleep 0.2
+        _waits=$((_waits + 1))
+    done
 }
 
 anikoto_feed_cleanup() {
@@ -745,11 +786,13 @@ anikoto_feed_cleanup() {
         wait "$anikoto_feed_pid" 2>/dev/null
         anikoto_feed_pid=""
     fi
+    # mop up any pump/cat processes still blocked on a segment fifo (their
+    # command line carries the feed dir path)
+    [ -n "$anikoto_feed_dir" ] && pkill -f "$anikoto_feed_dir" 2>/dev/null
     [ -n "$anikoto_feed_dir" ] && rm -rf "$anikoto_feed_dir"
     anikoto_feed_dir=""
     anikoto_feed_m3u8=""
     anikoto_feed_variant=""
-    anikoto_feed_fifo=0
 }
 
 # gets m3u8 stream URL from the active provider and selects quality
@@ -935,7 +978,13 @@ play_episode() {
             # cache=yes) and keep the demuxer read-ahead to ~5s, inside the
             # pre-buffered window; hr-seek keeps seeking working.
             if [ -n "$anikoto_feed_m3u8" ]; then
-                _mpv_args="$_mpv_args --hr-seek=absolute --cache=no --demuxer-max-bytes=50MiB --demuxer-max-back-bytes=0 --demuxer-readahead-secs=5"
+                # feed segments are FIFOs until the feeder streams them in, so a
+                # not-yet-written segment BLOCKS (buffering) instead of failing:
+                # cache=yes is safe here and gives the OSC its buffered-ahead
+                # line/cached time; cache-pause-initial=no starts playback as
+                # soon as the pre-buffered data exists instead of waiting to
+                # fill the whole 120s cache target.
+                _mpv_args="$_mpv_args --hr-seek=absolute --cache=yes --cache-secs=120 --cache-pause-initial=no --demuxer-max-bytes=50MiB --demuxer-max-back-bytes=0"
             else
                 _mpv_args="$_mpv_args --hr-seek=absolute --cache=yes --cache-secs=120 --demuxer-max-bytes=50MiB --demuxer-max-back-bytes=0 --demuxer-readahead-secs=30"
             fi
@@ -961,7 +1010,7 @@ play_episode() {
             _flatpak_resume=""
             [ -n "$_resume_pos" ] && [ "$_resume_pos" != "0" ] && _flatpak_resume="--start=$_resume_pos"
             if [ -n "$anikoto_feed_m3u8" ]; then
-                _flatpak_cache="--hr-seek=absolute --cache=no --demuxer-max-bytes=50MiB --demuxer-max-back-bytes=0 --demuxer-readahead-secs=5"
+                _flatpak_cache="--hr-seek=absolute --cache=yes --cache-secs=120 --cache-pause-initial=no --demuxer-max-bytes=50MiB --demuxer-max-back-bytes=0"
             else
                 _flatpak_cache="--hr-seek=absolute --cache=yes --cache-secs=120 --demuxer-max-bytes=50MiB --demuxer-max-back-bytes=0 --demuxer-readahead-secs=30"
             fi
