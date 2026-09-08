@@ -312,6 +312,8 @@ anikoto_referer=""
 anikoto_direct=0
 anikoto_master_body=""
 anikoto_master_url=""
+anikoto_sub_url=""
+anikoto_sub_label=""
 
 # extract server link-ids from a servers JSON; each type is tried in order and
 # all matching links are returned (hsub = hard subs, sub, soft-server, dub)
@@ -348,6 +350,44 @@ decrypt_anikoto_enc() {
     printf '%s' "$_dec" | sed -nE 's|.*"file":"([^"]*)".*|\1|p' | sed 's|\\/|/|g'
 }
 
+# picks the best soft-subtitle track from a getSources payload: prefers the
+# English/default track, else the first caption/subtitle track. stores url+label
+# in anikoto_sub_url/anikoto_sub_label for later --sub-file player injection.
+anikoto_pick_subtitle() {
+    _src="$1"
+    anikoto_sub_url=""
+    anikoto_sub_label=""
+    _tr="$(printf '%s' "$_src" | sed -nE 's|.*"tracks":\[([^]]*)\].*|\1|p')"
+    [ -z "$_tr" ] && return 1
+    _tf="$(mktemp "${TMPDIR:-/tmp}/anikoto-sub-XXXXXX")" || return 1
+    printf '%s' "$_tr" | sed 's|},{|}\n{|g' > "$_tf"
+    _a="" _al="" _d="" _dl="" _e="" _el="" _de="" _del=""
+    while IFS= read -r _obj; do
+        [ -n "$_obj" ] || continue
+        _kind="$(printf '%s' "$_obj" | sed -nE 's|.*"kind":"([^"]*)".*|\1|p')"
+        case "$_kind" in
+            *captions*|*subtitle*|*sub*) ;;
+            *) continue ;;
+        esac
+        _u="$(printf '%s' "$_obj" | sed -nE 's|.*"file":"([^"]*)".*|\1|p' | sed 's|\\/|/|g')"
+        [ -n "$_u" ] || continue
+        _l="$(printf '%s' "$_obj" | sed -nE 's|.*"label":"([^"]*)".*|\1|p')"
+        _def=0
+        printf '%s' "$_obj" | grep -q '"default": *true' && _def=1
+        [ -z "$_a" ] && { _a="$_u"; _al="$_l"; }
+        printf '%s' "$_l" | grep -qi 'english' && [ -z "$_e" ] && { _e="$_u"; _el="$_l"; }
+        [ "$_def" = 1 ] && [ -z "$_d" ] && { _d="$_u"; _dl="$_l"; }
+        [ "$_def" = 1 ] && printf '%s' "$_l" | grep -qi 'english' && [ -z "$_de" ] && { _de="$_u"; _del="$_l"; }
+    done < "$_tf"
+    rm -f "$_tf"
+    if [ -n "$_de" ]; then anikoto_sub_url="$_de"; anikoto_sub_label="$_del"
+    elif [ -n "$_d" ]; then anikoto_sub_url="$_d"; anikoto_sub_label="$_dl"
+    elif [ -n "$_e" ]; then anikoto_sub_url="$_e"; anikoto_sub_label="$_el"
+    elif [ -n "$_a" ]; then anikoto_sub_url="$_a"; anikoto_sub_label="$_al"
+    else return 1; fi
+    return 0
+}
+
 get_anikoto_m3u8() {
     _slug="$1"
     _ep_no="$2"
@@ -356,6 +396,8 @@ get_anikoto_m3u8() {
     anikoto_direct=0
     anikoto_master_body=""
     anikoto_master_url=""
+    anikoto_sub_url=""
+    anikoto_sub_label=""
     anime_id_anikoto "$_slug" || return 1
     anime_episodes_json_anikoto "$anikoto_numeric_id"
     _anchor="$(printf '%s' "$anikoto_ep_clean" \
@@ -466,6 +508,7 @@ get_anikoto_m3u8() {
         [ -z "$_chosen" ] && continue
         anikoto_m3u8="$_chosen"
         anikoto_referer="$_host"
+        anikoto_pick_subtitle "$_src" || true
         case "$_embed_url" in
             *vidtube*|*akirax*) anikoto_direct=1 ;;
             *) anikoto_direct=0 ;;
@@ -687,6 +730,10 @@ get_episode_url() {
     fi
 
     select_quality "$quality"
+    # soft subs come from megaplay's getSources "tracks": hand the best VTT to
+    # the player via --sub-file (mpv/vlc fetch it themselves with the referrer)
+    anikoto_sub_flag=""
+    [ -n "$anikoto_sub_url" ] && anikoto_sub_flag="--sub-file=$anikoto_sub_url"
     if printf "%s" "$ep_list" | grep -q "^$ep_no$"; then
         [ -z "$episode" ] && die "No valid sources found for episode $ep_no"
     else
@@ -828,9 +875,9 @@ play_episode() {
                 _mpv_args="$_mpv_args --cache=yes --cache-secs=120 --hr-seek=absolute --demuxer-max-bytes=50MiB --demuxer-max-back-bytes=0"
             fi
             if [ "$no_detach" = 0 ]; then
-                nohup $player_function $_mpv_args $skip_flag --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" "$episode" $refr_flag $player_extra_flags >/dev/null 2>&1 &
+                nohup $player_function $_mpv_args $skip_flag --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" "$episode" $refr_flag $anikoto_sub_flag $player_extra_flags >/dev/null 2>&1 &
             else
-                $player_function $_mpv_args $skip_flag $refr_flag --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" "$episode" $player_extra_flags
+                $player_function $_mpv_args $skip_flag $refr_flag --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" "$episode" $anikoto_sub_flag $player_extra_flags
                 mpv_exitcode=$?
                 [ "$exit_after_play" = 1 ] && [ -z "$range" ] && exit "$mpv_exitcode"
             fi
@@ -853,15 +900,15 @@ play_episode() {
                 _flatpak_cache="--cache=yes --cache-secs=120 --hr-seek=absolute --demuxer-max-bytes=50MiB --demuxer-max-back-bytes=0"
             fi
             if [ "$no_detach" = 0 ]; then
-                nohup flatpak run io.mpv.Mpv --input-ipc-server="$_mpv_socket" $_flatpak_resume $_flatpak_cache --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" $skip_flag "$episode" $refr_flag $player_extra_flags >/dev/null 2>&1 &
+                nohup flatpak run io.mpv.Mpv --input-ipc-server="$_mpv_socket" $_flatpak_resume $_flatpak_cache --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" $skip_flag "$episode" $refr_flag $anikoto_sub_flag $player_extra_flags >/dev/null 2>&1 &
             else
-                flatpak run io.mpv.Mpv --input-ipc-server="$_mpv_socket" $_flatpak_resume $_flatpak_cache --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" $skip_flag $refr_flag "$episode" $player_extra_flags
+                flatpak run io.mpv.Mpv --input-ipc-server="$_mpv_socket" $_flatpak_resume $_flatpak_cache --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" $skip_flag $refr_flag "$episode" $anikoto_sub_flag $player_extra_flags
                 mpv_exitcode=$?
                 [ "$exit_after_play" = 1 ] && [ -z "$range" ] && exit "$mpv_exitcode"
             fi
             ;;
-        vlc*) nohup $player_function --http-referrer="${refr_flag#--referrer=}" --play-and-exit --meta-title="${anime_title} Episode ${ep_no}" "$episode" $player_extra_flags >/dev/null 2>&1 & ;;
-        *yncpla*) nohup $player_function "$episode" $player_extra_flags -- --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" $refr_flag >/dev/null 2>&1 & ;;
+        vlc*) nohup $player_function --http-referrer="${refr_flag#--referrer=}" --play-and-exit --meta-title="${anime_title} Episode ${ep_no}" "$episode" $anikoto_sub_flag $player_extra_flags >/dev/null 2>&1 & ;;
+        *yncpla*) nohup $player_function "$episode" $player_extra_flags -- --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" $refr_flag $anikoto_sub_flag >/dev/null 2>&1 & ;;
         download) "$player_function" "$episode" "${anime_title} Episode ${ep_no}" $player_extra_flags ;;
         catt) nohup catt cast "$episode" $player_extra_flags >/dev/null 2>&1 & ;;
         iSH)
