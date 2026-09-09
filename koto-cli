@@ -981,12 +981,13 @@ play_episode() {
                 # feed segments are FIFOs until the feeder streams them in, so a
                 # not-yet-written segment BLOCKS (buffering) instead of failing:
                 # cache=yes is safe here and gives the OSC its buffered-ahead
-                # line/cached time; cache-pause-initial=no starts playback as
-                # soon as the pre-buffered data exists instead of waiting to
-                # fill the whole 120s cache target.
-                _mpv_args="$_mpv_args --hr-seek=absolute --cache=yes --cache-secs=120 --cache-pause-initial=no --demuxer-max-bytes=50MiB --demuxer-max-back-bytes=0"
+                # line/cached time. no --cache-secs (the default is huge) and a
+                # generous byte cap mean the cache-duration counter reflects real
+                # buffered data - it grows while watching and keeps filling while
+                # paused - instead of pinning at a fixed "Cache: 2m00s" ceiling.
+                _mpv_args="$_mpv_args --hr-seek=absolute --cache=yes --cache-pause-initial=no --demuxer-max-bytes=768MiB --demuxer-max-back-bytes=0"
             else
-                _mpv_args="$_mpv_args --hr-seek=absolute --cache=yes --cache-secs=120 --demuxer-max-bytes=50MiB --demuxer-max-back-bytes=0 --demuxer-readahead-secs=30"
+                _mpv_args="$_mpv_args --hr-seek=absolute --cache=yes --cache-pause-initial=no --demuxer-max-bytes=768MiB --demuxer-max-back-bytes=0 --demuxer-readahead-secs=30"
             fi
             if [ "$no_detach" = 0 ]; then
                 nohup $player_function $_mpv_args $skip_flag --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" "$episode" $refr_flag $anikoto_sub_flag $player_extra_flags >/dev/null 2>&1 &
@@ -1010,9 +1011,9 @@ play_episode() {
             _flatpak_resume=""
             [ -n "$_resume_pos" ] && [ "$_resume_pos" != "0" ] && _flatpak_resume="--start=$_resume_pos"
             if [ -n "$anikoto_feed_m3u8" ]; then
-                _flatpak_cache="--hr-seek=absolute --cache=yes --cache-secs=120 --cache-pause-initial=no --demuxer-max-bytes=50MiB --demuxer-max-back-bytes=0"
+                _flatpak_cache="--hr-seek=absolute --cache=yes --cache-pause-initial=no --demuxer-max-bytes=768MiB --demuxer-max-back-bytes=0"
             else
-                _flatpak_cache="--hr-seek=absolute --cache=yes --cache-secs=120 --demuxer-max-bytes=50MiB --demuxer-max-back-bytes=0 --demuxer-readahead-secs=30"
+                _flatpak_cache="--hr-seek=absolute --cache=yes --cache-pause-initial=no --demuxer-max-bytes=768MiB --demuxer-max-back-bytes=0 --demuxer-readahead-secs=30"
             fi
             if [ "$no_detach" = 0 ]; then
                 nohup flatpak run io.mpv.Mpv --input-ipc-server="$_mpv_socket" $_flatpak_resume $_flatpak_cache --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" $skip_flag "$episode" $refr_flag $anikoto_sub_flag $player_extra_flags >/dev/null 2>&1 &
