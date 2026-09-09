@@ -583,7 +583,7 @@ anikoto_probe_url=""
 anikoto_feed_stream() {
     _dir="$1"
     _off="$2"
-    _max=3
+    _max=8
     _i=0
     _urls=""
     while IFS= read -r _u; do
@@ -609,7 +609,7 @@ anikoto_feed_stream() {
                 _attempt=0
                 while [ "$_attempt" -lt 3 ]; do
                     _attempt=$((_attempt + 1))
-                    $curl_exe -sL --max-time 30 -A "$agent" -e "${anikoto_referer}/" "$_u" \
+                    $curl_exe -sL --max-time 60 -A "$agent" -e "${anikoto_referer}/" "$_u" \
                         > "$anikoto_feed_dir/raw${_i}.bin" 2>/dev/null
                     if [ -s "$anikoto_feed_dir/raw${_i}.bin" ]; then
                         tail -c +$((_off + 1)) "$anikoto_feed_dir/raw${_i}.bin" > "$anikoto_feed_dir/seg${_i}.ts.part" 2>/dev/null
