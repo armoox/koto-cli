@@ -581,7 +581,9 @@ anikoto_probe_url=""
 # lands as segN.dl, then a pump streams it THROUGH the segN.ts fifo to unblock
 # the player (a fifo open can never "fail" on a segment that isn't downloaded
 # yet, so mpv buffers instead of closing), and finally renames the real file
-# over the fifo so the segment is seekable again
+# over the fifo so the segment is seekable again. a segment that fails all
+# retries leaves an empty segN.fail that the pump streams the same way, so mpv
+# skips that gap instead of blocking on an empty fifo forever
 anikoto_feed_stream() {
     _dir="$1"
     _off="$2"
@@ -616,7 +618,7 @@ anikoto_feed_stream() {
                     # which doesn't carry the feed dir in its argv for pkill
                     _curlpid=""
                     trap 'kill "$_curlpid" 2>/dev/null; exit 0' TERM INT
-                    $curl_exe -sL --max-time 60 -A "$agent" -e "${anikoto_referer}/" "$_u" \
+                    $curl_exe -sL --max-time 30 -A "$agent" -e "${anikoto_referer}/" "$_u" \
                         > "$anikoto_feed_dir/raw${_i}.bin" 2>/dev/null &
                     _curlpid=$!
                     wait "$_curlpid" 2>/dev/null
@@ -645,6 +647,10 @@ anikoto_feed_stream() {
                     : > "$anikoto_feed_dir/seg${_i}.done"
                 else
                     rm -f "$anikoto_feed_dir/seg${_i}.ts.part"
+                    # permanent failure (CDN throttled/blocked): leave an empty
+                    # marker the pump will stream through the fifo, so mpv skips
+                    # this gap instead of blocking on an empty fifo forever
+                    : > "$anikoto_feed_dir/seg${_i}.fail"
                 fi
             ) &
             _pids="$_pids $!"
@@ -661,8 +667,10 @@ anikoto_feed_stream() {
         # seekable again
         for _s in $_allsegs; do
             _base="${_s%.ts}"
-            if [ -e "${_base}.dl" ] && [ ! -e "${_base}.pump" ] && [ -p "$_s" ]; then
-                mv -f "${_base}.dl" "${_base}.pump"
+            if { [ -e "${_base}.dl" ] || [ -e "${_base}.fail" ]; } && [ ! -e "${_base}.pump" ] && [ -p "$_s" ]; then
+                # .dl = downloaded data to stream through; .fail = empty placeholder
+                mv -f "${_base}.dl" "${_base}.pump" 2>/dev/null
+                [ -e "${_base}.fail" ] && mv -f "${_base}.fail" "${_base}.pump" 2>/dev/null
                 ( trap 'kill ${_cc:-0} 2>/dev/null; exit 0' TERM INT
                   cat "${_base}.pump" > "$_s" 2>/dev/null &
                   _cc=$!
@@ -720,6 +728,8 @@ anikoto_feed_stream() {
         done
         _ppids="${_npp# }"
     done
+    _nf=$(ls "$anikoto_feed_dir"/*.fail 2>/dev/null | wc -l | tr -d ' ')
+    [ "$_nf" -gt 0 ] && warn "Feed: %s segment(s) could not be downloaded - playback will skip those gaps" "$_nf"
 }
 
 # builds a local m3u8 + segment cache for an obfuscated variant stream and
