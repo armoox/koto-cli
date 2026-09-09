@@ -166,6 +166,7 @@ cleanup() {
     [ -n "$_player_pid" ] && kill "$_player_pid" 2>/dev/null
     rm -f "${histfile}.new" # remove temp logfile
     rm -f "${TMPDIR:-/tmp}"/anikoto-sub-file-* 2>/dev/null
+    rm -f "${TMPDIR:-/tmp}"/anikoto-probe-* 2>/dev/null
     anikoto_feed_cleanup
 }
 
@@ -584,7 +585,7 @@ anikoto_probe_url=""
 anikoto_feed_stream() {
     _dir="$1"
     _off="$2"
-    _max=8
+    _max="${feed_concurrency:-8}"
     _i=0
     _urls=""
     while IFS= read -r _u; do
@@ -779,12 +780,28 @@ start_anikoto_fifo() {
     # set by the downloader itself and never removed) means mpv starts as soon
     # as the first data actually exists, without racing the pump stage.
     _waits=0
+    _needed=4
     while [ "$_waits" -lt 150 ]; do
-        [ -e "$anikoto_feed_dir/seg0.done" ] && [ -e "$anikoto_feed_dir/seg1.done" ] \
-            && [ -e "$anikoto_feed_dir/seg2.done" ] && [ -e "$anikoto_feed_dir/seg3.done" ] && break
+        _ready=0
+        _n=0
+        while [ "$_n" -lt "$_needed" ]; do
+            [ -e "$anikoto_feed_dir/seg${_n}.done" ] && _ready=$((_ready + 1))
+            _n=$((_n + 1))
+        done
+        [ "$_ready" -ge "$_needed" ] && break
+        printf "\33[2K\r\033[1;34mBuffering %s/%s segments...\033[0m" "$_ready" "$_needed"
         sleep 0.2
         _waits=$((_waits + 1))
     done
+    printf "\33[2K\r"
+    if [ "$_ready" -lt "$_needed" ]; then
+        if [ "$_ready" -eq 0 ]; then
+            warn "No segments downloaded after 30s - CDN blocking or down; stopping"
+            anikoto_feed_cleanup
+            return 1
+        fi
+        warn "Only %s/%s segments buffered before start (slow CDN?)" "$_ready" "$_needed"
+    fi
 }
 
 anikoto_feed_cleanup() {
@@ -1119,6 +1136,9 @@ provider="${KOTO_CLI_PROVIDER:-anikoto}"
 download_dir="${KOTO_CLI_DOWNLOAD_DIR:-.}"
 log_episode="${KOTO_CLI_LOG:-1}"
 quality="${KOTO_CLI_QUALITY:-best}"
+# feeder: parallel segment downloads (lower it if a CDN throttles or 403s at 8)
+feed_concurrency="${KOTO_CLI_FEED_CONCURRENCY:-8}"
+case "$feed_concurrency" in ''|*[!0-9]*|[!1-9]*) feed_concurrency=8 ;; esac
 _platform="$(uname -a | cut -d " " -f 1,3-)"
 _os="$(uname -s)"
 case "$_platform" in
