@@ -582,13 +582,17 @@ anikoto_probe_url=""
 # the player (a fifo open can never "fail" on a segment that isn't downloaded
 # yet, so mpv buffers instead of closing), and finally renames the real file
 # over the fifo so the segment is seekable again. a segment that fails all
-# retries leaves an empty segN.fail that the pump streams the same way, so mpv
-# skips that gap instead of blocking on an empty fifo forever. downloads are
+# retries leaves a PERSISTENT segN.fail marker plus an empty segN.vac that the
+# pump streams through the fifo, so mpv skips that gap instead of blocking on
+# an empty fifo forever. downloads are
 # patient (10 attempts, ~5 min) so a throttled-but-alive CDN recovers inside
 # the buffered window and never becomes a gap; only hard failures (403,
 # refused) skip fast. if 5+ consecutive segments hard-fail the CDN is blocking
 # outright, so the feeder stops playback with a clear error instead of
-# skipping minutes of the episode
+# skipping minutes of the episode. a frontier stall detector force-skips a
+# segment with zero CDN progress for KOTO_CLI_FEED_STALL_SECONDS (default 90)
+# so a slow systemic block advances one segment at a time into the failure
+# guard (and aborts) instead of buffering indefinitely
 anikoto_feed_stream() {
     _dir="$1"
     _off="$2"
@@ -605,6 +609,9 @@ anikoto_feed_stream() {
     _ppids=""
     _batch=0
     _streak=0
+    _stalls=0
+    _lastdone=-1
+    _stall_ticks=$((feed_stall_seconds * 5))
 
     while true; do
         # start new downloads while we have slots and URLs left
@@ -620,6 +627,7 @@ anikoto_feed_stream() {
             (
                 _attempt=0
                 while [ "$_attempt" -lt 10 ]; do
+                    [ -d "$anikoto_feed_dir" ] || exit 0
                     _attempt=$((_attempt + 1))
                     # kill the in-flight curl on cleanup: TERM goes to this
                     # subshell (child of the feeder), so forward it to curl,
@@ -655,10 +663,13 @@ anikoto_feed_stream() {
                     : > "$anikoto_feed_dir/seg${_i}.done"
                 else
                     rm -f "$anikoto_feed_dir/seg${_i}.ts.part"
-                    # permanent failure (CDN throttled/blocked): leave an empty
-                    # marker the pump will stream through the fifo, so mpv skips
-                    # this gap instead of blocking on an empty fifo forever
+                    # permanent failure (CDN throttled/blocked): write a
+                    # PERSISTENT segN.fail marker (the pump/detectors/streak
+                    # guard rely on it) plus segN.vac, the empty placeholder the
+                    # pump streams through the fifo, so mpv skips this gap
+                    # instead of blocking on an empty fifo forever
                     : > "$anikoto_feed_dir/seg${_i}.fail"
+                    : > "$anikoto_feed_dir/seg${_i}.vac"
                 fi
             ) &
             _pids="$_pids $!"
@@ -675,16 +686,28 @@ anikoto_feed_stream() {
         # seekable again
         for _s in $_allsegs; do
             _base="${_s%.ts}"
-            if { [ -e "${_base}.dl" ] || [ -e "${_base}.fail" ]; } && [ ! -e "${_base}.pump" ] && [ -p "$_s" ]; then
-                # .dl = downloaded data to stream through; .fail = empty placeholder
-                mv -f "${_base}.dl" "${_base}.pump" 2>/dev/null
-                [ -e "${_base}.fail" ] && mv -f "${_base}.fail" "${_base}.pump" 2>/dev/null
-                ( trap 'kill ${_cc:-0} 2>/dev/null; exit 0' TERM INT
-                  cat "${_base}.pump" > "$_s" 2>/dev/null &
-                  _cc=$!
-                  wait "$_cc" 2>/dev/null
-                  mv -f "${_base}.pump" "$_s" 2>/dev/null ) &
-                _ppids="$_ppids $!"
+            if [ ! -e "${_base}.pump" ] && [ -p "$_s" ]; then
+                # stream .dl (real data) if it exists, else .vac (empty gap
+                # placeholder). real data wins over any stale/forced .fail.
+                # .fail itself is PERSISTENT - it is never consumed here, so
+                # the failure trackers keep seeing it after the gap is pumped
+                if [ -e "${_base}.dl" ]; then
+                    _src=".dl"
+                elif [ -e "${_base}.vac" ]; then
+                    _src=".vac"
+                else
+                    _src=""
+                fi
+                if [ -n "$_src" ]; then
+                    mv -f "${_base}${_src}" "${_base}.pump" 2>/dev/null
+                    [ "$_src" = ".dl" ] && rm -f "${_base}.fail"
+                    ( trap 'kill ${_cc:-0} 2>/dev/null; exit 0' TERM INT
+                      cat "${_base}.pump" > "$_s" 2>/dev/null &
+                      _cc=$!
+                      wait "$_cc" 2>/dev/null
+                      mv -f "${_base}.pump" "$_s" 2>/dev/null ) &
+                    _ppids="$_ppids $!"
+                fi
             fi
         done
 
@@ -736,6 +759,55 @@ anikoto_feed_stream() {
         done
         _ppids="${_npp# }"
 
+        # frontier stall detector: while downloads are still pending, if no
+        # segment has completed for KOTO_CLI_FEED_STALL_SECONDS, the CDN cannot
+        # deliver the next-needed segment - force it to a .fail (gap skip) so
+        # playback advances instead of buffering through the full retry
+        # patience each time. the forced skip also feeds the consecutive
+        # failure guard, so a truly-dead CDN aborts after a few of these
+        # instead of skipping the whole episode
+        if [ $# -gt 0 ] || [ -n "$_pids" ]; then
+            _d="$(ls "$anikoto_feed_dir"/*.done 2>/dev/null | wc -l | tr -d ' ')"
+            if [ -n "$_d" ] && [ "$_d" = "$_lastdone" ]; then
+                _stalls=$((_stalls + 1))
+            else
+                _stalls=0
+                _lastdone="$_d"
+            fi
+            if [ "$_stalls" -ge "$_stall_ticks" ]; then
+                _front=""
+                _fb=""
+                for _s in $_allsegs; do
+                    _b="${_s%.ts}"
+                    if [ ! -e "${_b}.done" ] && [ ! -e "${_b}.fail" ]; then _front="$_s"; _fb="$_b"; break; fi
+                done
+                if [ -n "$_front" ] && [ -p "$_front" ]; then
+                    # stop that segment's own retry loop first (it has made no
+                    # progress this whole window), then install the placeholder
+                    _rp="${_pids# }"; _rs="${_segs# }"
+                    while [ -n "$_rs" ]; do
+                        _p="${_rp%% *}"; _s="${_rs%% *}"
+                        case "$_rs" in
+                            *" "*) _rs="${_rs#* }"; _rp="${_rp#* }" ;;
+                            *)     _rs="" ; _rp="" ;;
+                        esac
+                        if [ "$_s" = "$_front" ]; then kill "$_p" 2>/dev/null; break; fi
+                    done
+                    sleep 0.3
+                    _n="${_fb##*/seg}"
+                    rm -f "${_fb}.ts.part" "$anikoto_feed_dir/raw${_n}.bin" "${_fb}.dl" 2>/dev/null
+                    : > "${_fb}.fail"
+                    : > "${_fb}.vac"
+                    _stalls=0
+                    warn "Feed: segment pending ${feed_stall_seconds}s with no CDN progress - skipping gap"
+                else
+                    _stalls=0
+                fi
+            fi
+        else
+            _lastdone="$(ls "$anikoto_feed_dir"/*.done 2>/dev/null | wc -l | tr -d ' ')"
+        fi
+
         # systemic-failure guard: if 5+ consecutive segments hard-fail, the CDN
         # is blocking outright - stop instead of skipping minutes of episode
         _streak=0
@@ -748,13 +820,13 @@ anikoto_feed_stream() {
             fi
         done
         if [ "$_streak" -ge 5 ]; then
-            warn "Feed: %s consecutive segments failed - CDN is blocking; stopping playback" "$_streak"
+            warn "Feed: ${_streak} consecutive segments failed - CDN is blocking; stopping playback"
             pkill -f "$anikoto_feed_dir/playlist.m3u8" 2>/dev/null
             break
         fi
     done
     _nf=$(ls "$anikoto_feed_dir"/*.fail 2>/dev/null | wc -l | tr -d ' ')
-    [ "$_nf" -gt 0 ] && warn "Feed: %s segment(s) could not be downloaded - playback will skip those gaps" "$_nf"
+    [ "$_nf" -gt 0 ] && warn "Feed: ${_nf} segment(s) could not be downloaded - playback will skip those gaps"
 }
 
 # builds a local m3u8 + segment cache for an obfuscated variant stream and
@@ -835,7 +907,7 @@ start_anikoto_fifo() {
             anikoto_feed_cleanup
             return 1
         fi
-        warn "Only %s/%s segments buffered before start (slow CDN?)" "$_ready" "$_needed"
+        warn "Only ${_ready}/${_needed} segments buffered before start (slow CDN?)"
     fi
 }
 
@@ -852,6 +924,9 @@ anikoto_feed_cleanup() {
     # a still-playing player (e.g. when switching episodes, where we want the
     # old player to keep running until it closes on its own).
     [ -n "$anikoto_feed_dir" ] && pkill -f "${anikoto_feed_dir}/seg[0-9]" 2>/dev/null
+    # let a just-killed downloader/pump subshell finish its TERM handler before
+    # removing the dir, so its final writes don't land in a deleted directory
+    sleep 0.2
     [ -n "$anikoto_feed_dir" ] && rm -rf "$anikoto_feed_dir"
     anikoto_feed_dir=""
     anikoto_feed_m3u8=""
@@ -1174,6 +1249,11 @@ quality="${KOTO_CLI_QUALITY:-best}"
 # feeder: parallel segment downloads (lower it if a CDN throttles or 403s at 8)
 feed_concurrency="${KOTO_CLI_FEED_CONCURRENCY:-8}"
 case "$feed_concurrency" in ''|*[!0-9]*|[!1-9]*) feed_concurrency=8 ;; esac
+# feeder: abort-timeout for a frontier segment with zero CDN progress - a slow
+# systemic block is force-skipped one segment at a time until the consecutive
+# failure guard stops the episode (lower it to fail faster on dead CDNs)
+feed_stall_seconds="${KOTO_CLI_FEED_STALL_SECONDS:-90}"
+case "$feed_stall_seconds" in ''|*[!0-9]*|[!1-9]*) feed_stall_seconds=90 ;; esac
 _platform="$(uname -a | cut -d " " -f 1,3-)"
 _os="$(uname -s)"
 case "$_platform" in
