@@ -162,6 +162,8 @@ where_mpv() {
 
 cleanup() {
     tput sgr0               # clears colors
+    # stop the detached player (menu quit / Ctrl-C); empty in foreground play
+    [ -n "$_player_pid" ] && kill "$_player_pid" 2>/dev/null
     rm -f "${histfile}.new" # remove temp logfile
     rm -f "${TMPDIR:-/tmp}"/anikoto-sub-file-* 2>/dev/null
     anikoto_feed_cleanup
@@ -573,13 +575,12 @@ anikoto_probe_url=""
 
 # background feeder: downloads each obfuscated segment, strips the junk prefix
 # and writes clean MPEG-TS so the player can read it (pure POSIX shell).
-# a sliding window keeps up to 3 downloads active at all times — when one
-# finishes the next starts immediately so mpv always has fresh data to read;
-# each segment is marked downloaded (segN.done), turned into segN.dl for a
-# pump that streams it through its fifo to unblock the player (a fifo open
-# can never "fail" on a segment that isn't downloaded yet, so mpv buffers
-# instead of closing), then the real file is renamed over the fifo so the
-# segment becomes seekable again
+# up to 8 segments download in parallel (_max) so the cache fills ahead of
+# playback; each successful segment writes a persistent segN.done marker and
+# lands as segN.dl, then a pump streams it THROUGH the segN.ts fifo to unblock
+# the player (a fifo open can never "fail" on a segment that isn't downloaded
+# yet, so mpv buffers instead of closing), and finally renames the real file
+# over the fifo so the segment is seekable again
 anikoto_feed_stream() {
     _dir="$1"
     _off="$2"
@@ -609,8 +610,15 @@ anikoto_feed_stream() {
                 _attempt=0
                 while [ "$_attempt" -lt 3 ]; do
                     _attempt=$((_attempt + 1))
+                    # kill the in-flight curl on cleanup: TERM goes to this
+                    # subshell (child of the feeder), so forward it to curl,
+                    # which doesn't carry the feed dir in its argv for pkill
+                    _curlpid=""
+                    trap 'kill "$_curlpid" 2>/dev/null; exit 0' TERM INT
                     $curl_exe -sL --max-time 60 -A "$agent" -e "${anikoto_referer}/" "$_u" \
-                        > "$anikoto_feed_dir/raw${_i}.bin" 2>/dev/null
+                        > "$anikoto_feed_dir/raw${_i}.bin" 2>/dev/null &
+                    _curlpid=$!
+                    wait "$_curlpid" 2>/dev/null
                     if [ -s "$anikoto_feed_dir/raw${_i}.bin" ]; then
                         tail -c +$((_off + 1)) "$anikoto_feed_dir/raw${_i}.bin" > "$anikoto_feed_dir/seg${_i}.ts.part" 2>/dev/null
                         _sb="$(od -An -N1 -t u1 "$anikoto_feed_dir/seg${_i}.ts.part" 2>/dev/null | tr -d ' ')"
@@ -714,9 +722,9 @@ anikoto_feed_stream() {
 }
 
 # builds a local m3u8 + segment cache for an obfuscated variant stream and
-# starts the feeder; strips junk prefix (fixed 252 bytes) from each segment.
-# segments are written via .part + atomic mv so a partial segment is never
-# visible, which lets mpv re-open segments for backward seeking
+# starts the feeder; the junk prefix is stripped using the TS offset probed
+# from the first segment (0 = already clean), re-scanning any segment whose
+# offset disagrees with the probe
 start_anikoto_fifo() {
     _variant_url="$1"
     _off="${2:-252}"
@@ -786,9 +794,12 @@ anikoto_feed_cleanup() {
         wait "$anikoto_feed_pid" 2>/dev/null
         anikoto_feed_pid=""
     fi
-    # mop up any pump/cat processes still blocked on a segment fifo (their
-    # command line carries the feed dir path)
-    [ -n "$anikoto_feed_dir" ] && pkill -f "$anikoto_feed_dir" 2>/dev/null
+    # mop up any pump/cat processes still blocked on a segment fifo. match the
+    # segment paths ($dir/segN...) and NOT the whole dir: the player's own
+    # command line carries $dir/playlist.m3u8, so a whole-dir sweep would kill
+    # a still-playing player (e.g. when switching episodes, where we want the
+    # old player to keep running until it closes on its own).
+    [ -n "$anikoto_feed_dir" ] && pkill -f "${anikoto_feed_dir}/seg[0-9]" 2>/dev/null
     [ -n "$anikoto_feed_dir" ] && rm -rf "$anikoto_feed_dir"
     anikoto_feed_dir=""
     anikoto_feed_m3u8=""
@@ -955,6 +966,7 @@ play_episode() {
             _mpv_socket="/tmp/koto-cli-mpv-$$"
             ;;
     esac
+    _player_pid=""
 
     # shellcheck disable=SC2086
     case "$player_function" in
@@ -967,38 +979,32 @@ play_episode() {
             [ -n "$_mpv_socket" ] && rm -f "$_mpv_socket"
             [ -n "$_mpv_socket" ] && _mpv_args="--input-ipc-server=$_mpv_socket"
             [ -n "$_resume_pos" ] && [ "$_resume_pos" != "0" ] && _mpv_args="$_mpv_args --start=$_resume_pos"
-            # keep mpv's own stream cache enabled (--cache=yes) only for direct streams,
-            # where every segment already exists remotely: the OSC then renders a
-            # visible "buffered ahead" line/cached time and mpv marks the cache
-            # filled within ~2min. the local feed is different: its playlist lists
-            # segments before their files exist, so ANY cache look-ahead lands on
-            # the download frontier, ffmpeg deems the not-yet-written segment
-            # failed and mpv treats the stream as ended and closes. so for the
-            # feed force the cache OFF (it also overrides a user mpv.conf
-            # cache=yes) and keep the demuxer read-ahead to ~5s, inside the
-            # pre-buffered window; hr-seek keeps seeking working.
+            # Run mpv's own stream cache (--cache=yes) on every stream. Direct
+            # playlists render a buffered-ahead line/cached time in the OSC as
+            # segments are prefetched. The local feed is safe too: its listed
+            # segments are FIFOs until the feeder streams data through them, so
+            # a not-yet-written segment BLOCKS (buffering) instead of failing
+            # and closing the stream. --cache-secs is deliberately unset (its
+            # default is huge) so the Cache counter tracks real buffered
+            # seconds - growing while watching, filling while paused - instead
+            # of pinning at a fixed ceiling; the byte cap is generous for the
+            # same reason.
             if [ -n "$anikoto_feed_m3u8" ]; then
-                # feed segments are FIFOs until the feeder streams them in, so a
-                # not-yet-written segment BLOCKS (buffering) instead of failing:
-                # cache=yes is safe here and gives the OSC its buffered-ahead
-                # line/cached time. no --cache-secs (the default is huge) and a
-                # generous byte cap mean the cache-duration counter reflects real
-                # buffered data - it grows while watching and keeps filling while
-                # paused - instead of pinning at a fixed "Cache: 2m00s" ceiling.
                 _mpv_args="$_mpv_args --hr-seek=absolute --cache=yes --cache-pause-initial=no --demuxer-max-bytes=768MiB --demuxer-max-back-bytes=0"
             else
+                # direct streams: a read-ahead window helps the cache fill faster
                 _mpv_args="$_mpv_args --hr-seek=absolute --cache=yes --cache-pause-initial=no --demuxer-max-bytes=768MiB --demuxer-max-back-bytes=0 --demuxer-readahead-secs=30"
             fi
             if [ "$no_detach" = 0 ]; then
-                nohup $player_function $_mpv_args $skip_flag --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" "$episode" $refr_flag $anikoto_sub_flag $player_extra_flags >/dev/null 2>&1 &
+                nohup $player_function $_mpv_args $skip_flag --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" "$episode" $refr_flag $anikoto_sub_flag $player_extra_flags >/dev/null 2>&1 & _player_pid=$!
             else
                 $player_function $_mpv_args $skip_flag $refr_flag --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" "$episode" $anikoto_sub_flag $player_extra_flags
                 mpv_exitcode=$?
                 [ "$exit_after_play" = 1 ] && [ -z "$range" ] && exit "$mpv_exitcode"
             fi
             ;;
-        android_mpv) "$player_function" "$episode" "${anime_title} Episode ${ep_no}" "--tls-verify=no $refr_flag" $player_extra_flags 2>&1 & ;;
-        android_vlc) nohup am start --user 0 -a android.intent.action.VIEW -d "$episode" -n org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerActivity -e "title" "${anime_title} Episode ${ep_no}" $player_extra_flags >/dev/null 2>&1 & ;;
+        android_mpv) "$player_function" "$episode" "${anime_title} Episode ${ep_no}" "--tls-verify=no $refr_flag" $player_extra_flags 2>&1 & _player_pid=$! ;;
+        android_vlc) nohup am start --user 0 -a android.intent.action.VIEW -d "$episode" -n org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerActivity -e "title" "${anime_title} Episode ${ep_no}" $player_extra_flags >/dev/null 2>&1 & _player_pid=$! ;;
         *iina*)
             [ -n "$refr_flag" ] && refr_flag="--mpv-${refr_flag#--}"
             if pgrep -f "IINA" >/dev/null 2>&1; then
@@ -1016,22 +1022,22 @@ play_episode() {
                 _flatpak_cache="--hr-seek=absolute --cache=yes --cache-pause-initial=no --demuxer-max-bytes=768MiB --demuxer-max-back-bytes=0 --demuxer-readahead-secs=30"
             fi
             if [ "$no_detach" = 0 ]; then
-                nohup flatpak run io.mpv.Mpv --input-ipc-server="$_mpv_socket" $_flatpak_resume $_flatpak_cache --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" $skip_flag "$episode" $refr_flag $anikoto_sub_flag $player_extra_flags >/dev/null 2>&1 &
+                nohup flatpak run io.mpv.Mpv --input-ipc-server="$_mpv_socket" $_flatpak_resume $_flatpak_cache --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" $skip_flag "$episode" $refr_flag $anikoto_sub_flag $player_extra_flags >/dev/null 2>&1 & _player_pid=$!
             else
                 flatpak run io.mpv.Mpv --input-ipc-server="$_mpv_socket" $_flatpak_resume $_flatpak_cache --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" $skip_flag $refr_flag "$episode" $anikoto_sub_flag $player_extra_flags
                 mpv_exitcode=$?
                 [ "$exit_after_play" = 1 ] && [ -z "$range" ] && exit "$mpv_exitcode"
             fi
             ;;
-        vlc*) nohup $player_function --http-referrer="${refr_flag#--referrer=}" --play-and-exit --meta-title="${anime_title} Episode ${ep_no}" "$episode" $anikoto_sub_flag $player_extra_flags >/dev/null 2>&1 & ;;
-        *yncpla*) nohup $player_function "$episode" $player_extra_flags -- --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" $refr_flag $anikoto_sub_flag >/dev/null 2>&1 & ;;
+        vlc*) nohup $player_function --http-referrer="${refr_flag#--referrer=}" --play-and-exit --meta-title="${anime_title} Episode ${ep_no}" "$episode" $anikoto_sub_flag $player_extra_flags >/dev/null 2>&1 & _player_pid=$! ;;
+        *yncpla*) nohup $player_function "$episode" $player_extra_flags -- --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" $refr_flag $anikoto_sub_flag >/dev/null 2>&1 & _player_pid=$! ;;
         download) "$player_function" "$episode" "${anime_title} Episode ${ep_no}" $player_extra_flags ;;
-        catt) nohup catt cast "$episode" $player_extra_flags >/dev/null 2>&1 & ;;
+        catt) nohup catt cast "$episode" $player_extra_flags >/dev/null 2>&1 & _player_pid=$! ;;
         iSH)
             printf "\e]8;;vlc://%s\a~~~~~~~~~~~~~~~~~~~~\n~ Tap to open VLC ~\n~~~~~~~~~~~~~~~~~~~~\e]8;;\a\n" "$episode"
             sleep 5
             ;;
-        *) nohup $player_function "$episode" $player_extra_flags >/dev/null 2>&1 & ;;
+        *) nohup $player_function "$episode" $player_extra_flags >/dev/null 2>&1 & _player_pid=$! ;;
     esac
     replay="$episode"
     unset episode
