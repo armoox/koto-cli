@@ -157,7 +157,8 @@ where_iina() {
 
 where_mpv() {
     command -v "flatpak" >/dev/null && flatpak info io.mpv.Mpv >/dev/null 2>&1 && printf "%s" "flatpak_mpv" && return 0
-    printf "%s" "mpv" && return 0
+    command -v "mpv" >/dev/null 2>&1 && printf "%s" "mpv" && return 0
+    printf "%s" "mpv"
 }
 
 cleanup() {
@@ -167,6 +168,7 @@ cleanup() {
     rm -f "${histfile}.new" # remove temp logfile
     rm -f "${TMPDIR:-/tmp}"/anikoto-sub-file-* 2>/dev/null
     rm -f "${TMPDIR:-/tmp}"/anikoto-probe-* 2>/dev/null
+    rm -f "${TMPDIR:-/tmp}"/koto-mpv-* 2>/dev/null
     anikoto_feed_cleanup
 }
 
@@ -182,6 +184,7 @@ select_quality() {
 
     refr_flag="--referrer=${anikoto_referer:-$provider_base}/"
     episode=$(printf "%s" "$result" | cut -d'>' -f2)
+    [ -n "$episode" ] || die "No playable stream link found (the CDN may be blocking or unreachable from this network)"
 
     # non-direct hosts (megaplay etc.) used to ship obfuscated segments that
     # the player can't handle, and the local feed stripped the junk per
@@ -1123,7 +1126,15 @@ play_episode() {
                 _mpv_args="$_mpv_args --hr-seek=absolute --cache=yes --cache-pause-initial=no --demuxer-max-bytes=768MiB --demuxer-max-back-bytes=0 --demuxer-readahead-secs=30"
             fi
             if [ "$no_detach" = 0 ]; then
-                nohup $player_function $_mpv_args $skip_flag --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" "$episode" $refr_flag $anikoto_sub_flag $player_extra_flags >/dev/null 2>&1 & _player_pid=$!
+                _mpv_errlog="${TMPDIR:-/tmp}/koto-mpv-$$.log"
+                nohup $player_function $_mpv_args $skip_flag --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" "$episode" $refr_flag $anikoto_sub_flag $player_extra_flags >"$_mpv_errlog" 2>&1 & _player_pid=$!
+                sleep 1
+                if ! kill -0 "$_player_pid" 2>/dev/null; then
+                    warn "Player exited immediately:"
+                    sed 's/^/    /' "$_mpv_errlog" | tail -6
+                    rm -f "$_mpv_errlog"
+                    _player_pid=""
+                fi
             else
                 $player_function $_mpv_args $skip_flag $refr_flag --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" "$episode" $anikoto_sub_flag $player_extra_flags
                 mpv_exitcode=$?
@@ -1149,7 +1160,15 @@ play_episode() {
                 _flatpak_cache="--hr-seek=absolute --cache=yes --cache-pause-initial=no --demuxer-max-bytes=768MiB --demuxer-max-back-bytes=0 --demuxer-readahead-secs=30"
             fi
             if [ "$no_detach" = 0 ]; then
-                nohup flatpak run io.mpv.Mpv --input-ipc-server="$_mpv_socket" $_flatpak_resume $_flatpak_cache --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" $skip_flag "$episode" $refr_flag $anikoto_sub_flag $player_extra_flags >/dev/null 2>&1 & _player_pid=$!
+                _mpv_errlog="${TMPDIR:-/tmp}/koto-mpv-$$.log"
+                nohup flatpak run io.mpv.Mpv --input-ipc-server="$_mpv_socket" $_flatpak_resume $_flatpak_cache --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" $skip_flag "$episode" $refr_flag $anikoto_sub_flag $player_extra_flags >"$_mpv_errlog" 2>&1 & _player_pid=$!
+                sleep 1
+                if ! kill -0 "$_player_pid" 2>/dev/null; then
+                    warn "Player exited immediately:"
+                    sed 's/^/    /' "$_mpv_errlog" | tail -6
+                    rm -f "$_mpv_errlog"
+                    _player_pid=""
+                fi
             else
                 flatpak run io.mpv.Mpv --input-ipc-server="$_mpv_socket" $_flatpak_resume $_flatpak_cache --tls-verify=no --force-media-title="${anime_title} Episode ${ep_no}" $skip_flag $refr_flag "$episode" $anikoto_sub_flag $player_extra_flags
                 mpv_exitcode=$?
@@ -1386,7 +1405,16 @@ case "$player_function" in
     download) dep_ch_failover "yt-dlp,ffmpeg" >/dev/null || die 'Neither yt-dlp nor ffmpeg found' ;;
     android*) printf "\33[2K\rChecking of players on Android is disabled.\n" ;;
     *iSH*) printf "\33[2K\rChecking of players on iOS is disabled\n" ;;
-    mpv|flatpak_mpv) dep_ch "socat" ;;
+    mpv|flatpak_mpv)
+        dep_ch "socat"
+        if [ "$player_function" = "flatpak_mpv" ]; then
+            flatpak info io.mpv.Mpv >/dev/null 2>&1 \
+                || die 'Flatpak player io.mpv.Mpv not found - install it: flatpak install io.mpv.Mpv'
+        else
+            command -v mpv >/dev/null 2>&1 \
+                || die 'Player mpv not found - install it: sudo pacman -S mpv (or set KOTO_CLI_PLAYER)'
+        fi
+        ;;
     *) dep_ch "$player_function" ;;
 esac
 
